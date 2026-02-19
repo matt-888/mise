@@ -1,0 +1,218 @@
+name: registry
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - release
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.pull_request.number || github.event.pull_request.number || 'push' }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+  MISE_EXPERIMENTAL: 1
+  MISE_LOCKFILE: 1
+  MISE_USE_VERSIONS_HOST_TRACK: 0
+  RUST_BACKTRACE: 1
+  GITHUB_TOKEN: ${{ secrets.MISE_GH_TOKEN || secrets.GITHUB_TOKEN }}
+
+jobs:
+  check-changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      registry-changed: ${{ steps.check.outputs.registry-changed }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - id: check
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] || [ "${{ github.event_name }}" == "push" ]; then
+            echo "registry-changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Check if relevant files changed
+          if git diff --name-only ${{ github.event.pull_request.base.sha }} HEAD | grep -qE '^(registry/.*\.toml|\.github/workflows/registry\.yml|src/cli/test_tool\.rs)$'; then
+            echo "registry-changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "registry-changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    needs: check-changes
+    if: needs.check-changes.outputs.registry-changed == 'true'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2
+        with:
+          shared-key: build
+          save-if: false
+      - run: cargo build --all-features
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mise
+          path: target/debug/mise
+
+  list-changed-tools:
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    needs: check-changes
+    if: github.event_name == 'pull_request' && needs.check-changes.outputs.registry-changed == 'true'
+    outputs:
+      tools: ${{ steps.determine-tools.outputs.tools }}
+      new_tools: ${{ steps.registry-diff.outputs.new_tools }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - id: workflow-check
+        run: |
+          if git diff --name-only ${{ github.event.pull_request.base.sha }} HEAD | grep -q ".github/workflows/registry.yml"; then
+            echo "modified=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: ./.github/actions/registry-diff
+        id: registry-diff
+        if: steps.workflow-check.outputs.modified != 'true'
+        with:
+          base_sha: ${{ github.event.pull_request.base.sha }}
+      - id: determine-tools
+        run: |
+          if [ "${{ steps.workflow-check.outputs.modified }}" == "true" ]; then
+            echo "Workflow modified, running all tests"
+            echo "tools=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          tools="${{ steps.registry-diff.outputs.modified_tools }}"
+          count=$(echo "$tools" | wc -w)
+          echo "Modified tools count: $(echo "$tools" | wc -w)"
+
+          if [ "$count" -gt 30 ]; then
+            echo "Over 30 tools updated, running all tests"
+            echo "tools=" >> "$GITHUB_OUTPUT"
+          else
+            echo "tools=$tools" >> "$GITHUB_OUTPUT"
+          fi
+
+  validate-new-tools:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: list-changed-tools
+    if: |
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.user.login != 'jdx' &&
+      needs.list-changed-tools.outputs.new_tools != ''
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Check new tools have tests
+        run: |
+          missing_tests=""
+          for tool in ${{ needs.list-changed-tools.outputs.new_tools }}; do
+            if ! grep -q '^test = ' "registry/$tool.toml"; then
+              missing_tests="$missing_tests $tool"
+            fi
+          done
+          if [ -n "$missing_tests" ]; then
+            echo "::error::New tools missing required 'test' field:$missing_tests"
+            echo ""
+            echo "All new tools must include a test field, e.g.:"
+            echo '  test = ["mytool --version", "v{{version}}"]'
+            exit 1
+          fi
+          echo "All new tools have tests"
+
+  test-tool:
+    name: test-tool-${{ matrix.tranche }}
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    needs:
+      - build
+      - list-changed-tools
+      - validate-new-tools
+    if: |
+      !cancelled() &&
+      needs.build.result == 'success' &&
+      (needs.list-changed-tools.result == 'success' || needs.list-changed-tools.result == 'skipped') &&
+      (needs.validate-new-tools.result == 'success' || needs.validate-new-tools.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        tranche: ${{ fromJson(needs.list-changed-tools.outputs.tools == '' && '[0,1,2,3,4,5,6,7]' || '[0]') }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Fetch token from pool
+        id: token
+        uses: ./.github/actions/fetch-token
+        with:
+          api-secret: ${{ secrets.MISE_VERSIONS_API_SECRET }}
+      - name: Set GITHUB_TOKEN from pool
+        if: steps.token.outputs.token
+        run: echo "GITHUB_TOKEN=${{ steps.token.outputs.token }}" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: mise
+          path: target/debug
+      - run: echo target/debug >> "$GITHUB_PATH"
+      - run: chmod +x target/debug/mise
+      - run: mise -v
+      - uses: ./.github/actions/mise-tools
+      - id: test-tools
+        env:
+          TEST_TRANCHE: ${{ matrix.tranche }}
+          TEST_TRANCHE_COUNT: ${{ needs.list-changed-tools.outputs.tools == '' && 8 || 1 }}
+        run: |
+          mise test-tool ${{ needs.list-changed-tools.outputs.tools == '' && '--all' || needs.list-changed-tools.outputs.tools }} || true
+          failed_tools=$(grep "Failed Tools" "$GITHUB_STEP_SUMMARY" | sed 's/\*\*Failed Tools\*\*: //' | tr ',' ' ')
+          echo "failed_tools=$failed_tools" >> "$GITHUB_OUTPUT"
+      - name: Retry failed tools
+        if: steps.test-tools.outputs.failed_tools != '' && github.head_ref != 'release' && github.ref != 'refs/heads/release'
+        run: mise run test-tool-retry ${{ steps.test-tools.outputs.failed_tools }}
+      - name: Retry failed tools (with grace period for new upstream releases)
+        if: steps.test-tools.outputs.failed_tools != '' && (github.head_ref == 'release' || github.ref == 'refs/heads/release')
+        run: mise run test-tool-retry --grace-period ${{ steps.test-tools.outputs.failed_tools }}
+
+  registry-ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    needs:
+      - check-changes
+      - build
+      - list-changed-tools
+      - validate-new-tools
+      - test-tool
+    if: ${{ !cancelled() }}
+    steps:
+      - name: Check CI job results
+        run: |
+          if [ "${{ needs.check-changes.result }}" != "success" ]; then
+            echo "check-changes job failed"
+            exit 1
+          fi
+          if [ "${{ needs.check-changes.outputs.registry-changed }}" != "true" ]; then
+            echo "No registry changes detected, skipping registry CI checks"
+            exit 0
+          fi
+          if [ "${{ needs.build.result }}" != "success" ]; then
+            echo "build failed or was skipped"
+            exit 1
+          fi
+          if [ "${{ needs.list-changed-tools.result }}" != "success" ] && [ "${{ needs.list-changed-tools.result }}" != "skipped" ]; then
+            echo "list-changed-tools failed"
+            exit 1
+          fi
+          if [ "${{ needs.validate-new-tools.result }}" == "failure" ]; then
+            echo "validate-new-tools failed - new tools must include tests"
+            exit 1
+          fi
+          if [ "${{ needs.test-tool.result }}" != "success" ]; then
+            echo "test-tool failed or was skipped"
+            exit 1
+          fi
+          echo "All CI jobs completed successfully"

@@ -1,0 +1,122 @@
+name: release-custom
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release-custom
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-tarball-linux:
+    name: build-tarball-${{matrix.name}}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            target: x86_64-unknown-linux-gnu
+          - name: linux-x64-musl
+            target: x86_64-unknown-linux-musl
+          - name: linux-arm64
+            target: aarch64-unknown-linux-gnu
+          - name: linux-arm64-musl
+            target: aarch64-unknown-linux-musl
+          - name: linux-armv7
+            target: armv7-unknown-linux-gnueabi
+          - name: linux-armv7-musl
+            target: armv7-unknown-linux-musleabi
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry/cache
+          key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-registry
+      - name: build-tarball ${{matrix.target}}
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 45
+          max_attempts: 3
+          command: scripts/build-tarball.sh ${{matrix.target}}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarball-${{matrix.target}}
+          path: |
+            dist/mise-*.tar.xz
+            dist/mise-*.tar.gz
+            dist/mise-*.tar.zst
+          if-no-files-found: error
+
+  build-tarball-macos:
+    name: build-tarball-${{matrix.name}}
+    runs-on: macos-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-x64
+            target: x86_64-apple-darwin
+          - name: macos-arm64
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry/cache
+          key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-registry
+      - run: rustup target add ${{matrix.target}}
+      - name: build-tarball ${{matrix.target}}
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 90
+          max_attempts: 3
+          command: scripts/build-tarball.sh ${{matrix.target}}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarball-${{matrix.target}}
+          path: |
+            dist/mise-*.tar.xz
+            dist/mise-*.tar.gz
+            dist/mise-*.tar.zst
+          if-no-files-found: error
+
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    needs:
+      - build-tarball-linux
+      - build-tarball-macos
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: tarball-*
+          merge-multiple: true
+      - name: Update latest release
+        run: |
+          gh release delete latest --yes 2>/dev/null || true
+          git tag -f latest
+          git push -f origin latest
+          gh release create latest \
+            --title "latest" \
+            --notes "Built from ${{ github.sha }}" \
+            --latest \
+            artifacts/*
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
