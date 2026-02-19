@@ -99,34 +99,6 @@ jobs:
             dist/mise-*.tar.zst
           if-no-files-found: error
 
-  build-tarball-windows:
-    name: build-tarball-windows-${{matrix.arch}}
-    runs-on: windows-latest
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: arm64
-            target: aarch64-pc-windows-msvc
-          - arch: x64
-            target: x86_64-pc-windows-msvc
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup target add ${{matrix.target}}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{matrix.arch}}
-      - run: scripts/build-tarball.ps1 ${{matrix.target}}
-        env:
-          OS: windows
-          ARCH: ${{matrix.arch}}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: tarball-${{matrix.target}}
-          path: dist/*.zip
-          if-no-files-found: error
-
   release:
     runs-on: ubuntu-latest
     timeout-minutes: 10
