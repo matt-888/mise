@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -8,6 +8,7 @@ use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use eyre::{Report, Result, bail, ensure};
 use regex::Regex;
+use reqwest::StatusCode;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{ClientBuilder, IntoUrl, Method, Response};
 use std::sync::LazyLock as Lazy;
@@ -306,25 +307,136 @@ impl Client {
     ) -> Result<()> {
         let url = url.into_url()?;
         debug!("GET Downloading {} to {}", &url, display_path(path));
-        let mut resp = self.get_async_with_headers(url.clone(), headers).await?;
-        if let Some(length) = resp.content_length()
-            && let Some(pr) = pr
-        {
-            // Reset progress on each attempt
-            pr.set_length(length);
-            pr.set_position(0);
-        }
 
         let parent = path.parent().unwrap();
         file::create_dir_all(parent)?;
-        let mut file = tempfile::NamedTempFile::with_prefix_in(path, parent)?;
-        while let Some(chunk) = resp.chunk().await? {
-            file.write_all(&chunk)?;
-            if let Some(pr) = pr {
-                pr.inc(chunk.len() as u64);
+        let part_path = part_path_for(path);
+
+        let max_retries = Settings::get().http_retries.max(3) as u32;
+        let mut attempt = 0u32;
+        let mut last_error: Option<Report> = None;
+
+        loop {
+            if attempt > max_retries {
+                break;
+            }
+
+            if attempt > 0 {
+                let delay = download_backoff_delay(attempt);
+                debug!(
+                    "Retrying download (attempt {}/{}) after {}ms",
+                    attempt,
+                    max_retries,
+                    delay.as_millis()
+                );
+                tokio::time::sleep(delay).await;
+            }
+
+            let bytes_downloaded = match std::fs::metadata(&part_path) {
+                Ok(m) => m.len(),
+                Err(_) => 0,
+            };
+
+            // Build request with Range header if resuming
+            let mut req_headers = headers.clone();
+            if bytes_downloaded > 0 {
+                req_headers.insert(
+                    reqwest::header::RANGE,
+                    HeaderValue::from_str(&format!("bytes={bytes_downloaded}-")).unwrap(),
+                );
+                debug!("Resuming download from byte {}", bytes_downloaded);
+            }
+
+            let resp = match self
+                .send_with_https_fallback(Method::GET, url.clone(), &req_headers, "GET")
+                .await
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    // Check for 416 Range Not Satisfiable — part file is stale
+                    if error_code(&e) == Some(416) {
+                        debug!("Got 416 Range Not Satisfiable, deleting part file and restarting");
+                        let _ = std::fs::remove_file(&part_path);
+                        // Don't count this as a retry attempt
+                        continue;
+                    }
+                    last_error = Some(e);
+                    attempt += 1;
+                    continue;
+                }
+            };
+
+            let status = resp.status();
+            let (mut file, start_pos) = if status == StatusCode::PARTIAL_CONTENT {
+                // Server supports Range, append to existing part file
+                let total = parse_content_range_total(resp.headers());
+                if let Some(pr) = pr {
+                    if let Some(total) = total {
+                        pr.set_length(total);
+                    }
+                    pr.set_position(bytes_downloaded);
+                }
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&part_path)?;
+                (file, bytes_downloaded)
+            } else {
+                // 200 OK — server sent full file, start from scratch
+                if let Some(pr) = pr {
+                    if let Some(length) = resp.content_length() {
+                        pr.set_length(length);
+                    }
+                    pr.set_position(0);
+                }
+                let file = std::fs::File::create(&part_path)?;
+                (file, 0u64)
+            };
+
+            // Stream the response body
+            let stream_result = self
+                .stream_response_to_file(resp, &mut file, pr, start_pos)
+                .await;
+
+            drop(file);
+
+            match stream_result {
+                Ok(()) => {
+                    // Success — atomic move to final destination
+                    std::fs::rename(&part_path, path)?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    debug!("Download stream error: {e}");
+                    last_error = Some(e);
+                    attempt += 1;
+                    continue;
+                }
             }
         }
-        file.persist(path)?;
+
+        // All retries exhausted — clean up part file
+        let _ = std::fs::remove_file(&part_path);
+        Err(last_error
+            .unwrap_or_else(|| eyre::eyre!("download failed after {max_retries} retries")))
+    }
+
+    /// Stream response body chunks to a file, updating progress bar.
+    async fn stream_response_to_file(
+        &self,
+        mut resp: Response,
+        file: &mut std::fs::File,
+        pr: Option<&dyn SingleReport>,
+        start_pos: u64,
+    ) -> Result<()> {
+        let mut written = start_pos;
+        while let Some(chunk) = resp.chunk().await? {
+            file.write_all(&chunk)?;
+            written += chunk.len() as u64;
+            if let Some(pr) = pr {
+                pr.set_position(written);
+            }
+        }
         Ok(())
     }
 
@@ -556,6 +668,30 @@ fn default_backoff_strategy(retries: i64) -> impl Iterator<Item = std::time::Dur
     ExponentialBackoff::from_millis(10)
         .map(jitter)
         .take(retries.max(0) as usize)
+}
+
+/// Compute the `.part` file path for a given download destination.
+fn part_path_for(path: &Path) -> PathBuf {
+    let mut part = path.as_os_str().to_owned();
+    part.push(".part");
+    PathBuf::from(part)
+}
+
+/// Parse the total file size from a `Content-Range` header.
+/// Expected format: `bytes <start>-<end>/<total>` (e.g. `bytes 0-999/5000`).
+fn parse_content_range_total(headers: &HeaderMap) -> Option<u64> {
+    let value = headers.get(reqwest::header::CONTENT_RANGE)?.to_str().ok()?;
+    let total_str = value.rsplit_once('/')?.1;
+    if total_str == "*" {
+        return None;
+    }
+    total_str.parse().ok()
+}
+
+/// Exponential backoff delay for download retries, capped at 30 seconds.
+fn download_backoff_delay(attempt: u32) -> Duration {
+    let base_ms = 500u64.saturating_mul(1u64 << attempt.min(6));
+    Duration::from_millis(base_ms.min(30_000))
 }
 
 #[cfg(test)]
@@ -838,5 +974,52 @@ mod tests {
                 "https://cdn.example.com/artifacts/v1.0.0/file.tar.gz"
             );
         });
+    }
+
+    #[test]
+    fn test_part_path_for() {
+        let path = Path::new("/tmp/downloads/python-3.12.tar.gz");
+        assert_eq!(
+            part_path_for(path),
+            PathBuf::from("/tmp/downloads/python-3.12.tar.gz.part")
+        );
+    }
+
+    #[test]
+    fn test_parse_content_range_total() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_RANGE,
+            HeaderValue::from_static("bytes 1000-1999/5000"),
+        );
+        assert_eq!(parse_content_range_total(&headers), Some(5000));
+    }
+
+    #[test]
+    fn test_parse_content_range_total_unknown() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_RANGE,
+            HeaderValue::from_static("bytes 0-999/*"),
+        );
+        assert_eq!(parse_content_range_total(&headers), None);
+    }
+
+    #[test]
+    fn test_parse_content_range_total_missing() {
+        let headers = HeaderMap::new();
+        assert_eq!(parse_content_range_total(&headers), None);
+    }
+
+    #[test]
+    fn test_download_backoff_delay() {
+        // First retry: 500 * 2^1 = 1000ms
+        assert_eq!(download_backoff_delay(1), Duration::from_millis(1000));
+        // Second retry: 500 * 2^2 = 2000ms
+        assert_eq!(download_backoff_delay(2), Duration::from_millis(2000));
+        // Third retry: 500 * 2^3 = 4000ms
+        assert_eq!(download_backoff_delay(3), Duration::from_millis(4000));
+        // High attempt should cap at 30 seconds
+        assert_eq!(download_backoff_delay(10), Duration::from_millis(30_000));
     }
 }

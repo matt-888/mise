@@ -1113,7 +1113,7 @@ pub trait Backend: Debug + Send + Sync {
     fn create_install_dirs(&self, tv: &ToolVersion) -> eyre::Result<()> {
         let _ = remove_all_with_warning(tv.install_path());
         if !Settings::get().always_keep_download {
-            let _ = remove_all_with_warning(tv.download_path());
+            let _ = remove_download_dir_except_parts(tv.download_path());
         }
         let _ = remove_all_with_warning(tv.cache_path());
         let _ = file::remove_file(tv.install_path()); // removes if it is a symlink
@@ -1578,5 +1578,34 @@ pub async fn reset() -> Result<()> {
     install_state::reset();
     *TOOLS.lock().unwrap() = None;
     load_tools().await?;
+    Ok(())
+}
+
+/// Remove all files in a download directory except `.part` files (partial downloads).
+/// This allows resumable downloads to survive across `mise install` retries.
+fn remove_download_dir_except_parts<P: AsRef<Path>>(path: P) -> Result<()> {
+    let path = path.as_ref();
+    if !path.exists() {
+        return Ok(());
+    }
+    let entries = std::fs::read_dir(path)?;
+    let mut has_part_files = false;
+    for entry in entries {
+        let entry = entry?;
+        let entry_path = entry.path();
+        if entry_path.extension().is_some_and(|ext| ext == "part") {
+            has_part_files = true;
+            continue;
+        }
+        if entry_path.is_dir() {
+            let _ = remove_all_with_warning(&entry_path);
+        } else {
+            let _ = file::remove_file(&entry_path);
+        }
+    }
+    if !has_part_files {
+        // No .part files to preserve, remove the directory itself
+        let _ = remove_all_with_warning(path);
+    }
     Ok(())
 }
