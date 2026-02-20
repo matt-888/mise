@@ -1,4 +1,4 @@
-name: release-custom
+name: release-simple
 
 on:
   push:
