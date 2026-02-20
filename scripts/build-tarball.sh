@@ -61,7 +61,7 @@ os=$(get_os)
 arch=$(get_arch)
 suffix=$(get_suffix)
 version=$(./scripts/get-version.sh)
-basename=mise-$version-$os-$arch$suffix
+basename=mise-$os-$arch$suffix
 
 case "$os-$arch" in
 linux-arm*)
