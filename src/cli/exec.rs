@@ -125,6 +125,26 @@ impl Exec {
         });
 
         let (program, mut args) = parse_command(&env::SHELL, &self.command, &self.c);
+
+        // On Unix, resolve the program to its full mise-installed path if it is
+        // provided by a mise-managed tool. This prevents infinite recursion when
+        // a wrapper script (e.g., .devcontainer/bin/tool) calls `mise x -- tool`:
+        // without this, execvp would find the wrapper again (since it precedes
+        // the mise install path in PATH) and loop until E2BIG.
+        // On Windows, exec_program uses which::which_in with PATHEXT to resolve
+        // the correct executable (.cmd/.exe), so we skip this to avoid passing
+        // a pre-resolved path that bypasses Windows-specific extension handling.
+        #[cfg(unix)]
+        let program = if !program.contains('/') {
+            if let Some(bin) = ts.which_bin(&config, &program).await {
+                bin.to_string_lossy().to_string()
+            } else {
+                program
+            }
+        } else {
+            program
+        };
+
         let mut env = measure!("env_with_path", { ts.env_with_path(&config).await? });
 
         // Run auto-enabled prepare steps (unless --no-prepare)
@@ -188,6 +208,30 @@ where
     }
     let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
     let program = program.to_executable();
+    // Strip shims directory from PATH for program resolution only, to prevent
+    // recursive shim execution. Wrapper scripts may call `mise x -- tool`,
+    // which re-enters Exec. If shims remain in PATH (due to
+    // not_found_auto_install), the wrapper is found again instead of the real
+    // tool, causing an infinite loop that grows PATH until E2BIG.
+    // The child process still inherits the full PATH (with shims) so
+    // subprocesses can find tools via shims.
+    let program = if program.to_string_lossy().contains('/') {
+        // Already a path, no need to resolve
+        program
+    } else {
+        let cwd = crate::dirs::CWD.clone().unwrap_or_default();
+        let lookup_path = env.get(&*env::PATH_KEY).map(|path_val| {
+            let shims_dir = &*crate::dirs::SHIMS;
+            let filtered: Vec<_> = std::env::split_paths(&OsString::from(path_val))
+                .filter(|p| p != shims_dir)
+                .collect();
+            std::env::join_paths(&filtered).unwrap()
+        });
+        match which::which_in(&program, lookup_path, cwd) {
+            Ok(resolved) => resolved.into_os_string(),
+            Err(_) => program, // Fall back to original if resolution fails
+        }
+    };
     let err = exec::Command::new(program.clone()).args(&args).exec();
     bail!("{:?} {err}", program.to_string_lossy())
 }

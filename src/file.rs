@@ -735,6 +735,7 @@ impl TarFormat {
             "bz2" | "tbz2" => TarFormat::TarBz2,
             "zst" | "tzst" => TarFormat::TarZst,
             "zip" => TarFormat::Zip,
+            "vsix" => TarFormat::Zip,
             "7z" => TarFormat::SevenZip,
             _ => TarFormat::Raw,
         }
@@ -900,6 +901,7 @@ fn open_tar(format: TarFormat, archive: &Path) -> Result<Box<dyn std::io::Read>>
             Some("zst") => open_tar(TarFormat::TarZst, archive)?,
             Some("tar") => open_tar(TarFormat::Tar, archive)?,
             Some("zip") => bail!("zip format not supported"),
+            Some("vsix") => bail!("vsix format not supported"),
             _ => open_tar(TarFormat::TarGz, archive)?,
         },
     })
