@@ -59,6 +59,7 @@ jobs:
           if-no-files-found: error
 
   build-tarball-macos:
+    if: false
     name: build-tarball-${{matrix.name}}
     runs-on: macos-latest
     timeout-minutes: 90
@@ -66,8 +67,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          #- name: macos-arm64
-          #  target: aarch64-apple-darwin
+          - name: macos-arm64
+            target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache@v4
