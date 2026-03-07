@@ -109,12 +109,14 @@ impl Backend for VfoxBackend {
         if self.is_backend_plugin() {
             Settings::get().ensure_experimental("custom backends")?;
             let tool_name = self.get_tool_name()?;
+            let tool_opts = tv.request.options();
             vfox.backend_install(
                 &self.pathname,
                 tool_name,
                 &tv.version,
                 tv.install_path(),
                 tv.download_path(),
+                tool_opts.opts_as_strings(),
             )
             .await
             .wrap_err("Backend install method failed")?;
@@ -169,23 +171,20 @@ impl Backend for VfoxBackend {
         Some(&self.plugin_enum)
     }
 
-    async fn idiomatic_filenames(&self) -> eyre::Result<Vec<String>> {
+    async fn _idiomatic_filenames(&self) -> eyre::Result<Vec<String>> {
         let (vfox, _log_rx) = self.plugin.vfox();
 
         let metadata = vfox.metadata(&self.pathname).await?;
         Ok(metadata.legacy_filenames)
     }
 
-    async fn parse_idiomatic_file(&self, path: &Path) -> eyre::Result<String> {
+    async fn _parse_idiomatic_file(&self, path: &Path) -> eyre::Result<Vec<String>> {
         let (vfox, _log_rx) = self.plugin.vfox();
         let response = vfox.parse_legacy_file(&self.pathname, path).await?;
-        response.version.ok_or_else(|| {
-            eyre::eyre!(
-                "Version for {} not found in '{}'",
-                self.pathname,
-                path.display()
-            )
-        })
+        if let Some(version) = response.version {
+            return Ok(version.split_whitespace().map(|s| s.to_string()).collect());
+        }
+        Ok(vec![])
     }
 
     async fn get_tarball_url(
@@ -292,9 +291,26 @@ impl VfoxBackend {
                 // Use backend methods if the plugin supports them
                 let env_keys = if self.is_backend_plugin() {
                     let tool_name = self.get_tool_name()?;
-                    vfox.backend_exec_env(&self.pathname, tool_name, &tv.version, tv.install_path())
-                        .await
-                        .wrap_err("Backend exec env method failed")?
+                    vfox.backend_exec_env(
+                        &self.pathname,
+                        tool_name,
+                        &tv.version,
+                        tv.install_path(),
+                        opts.opts
+                            .iter()
+                            .map(|(k, v)| {
+                                (
+                                    k.clone(),
+                                    match v {
+                                        toml::Value::String(s) => s.clone(),
+                                        _ => v.to_string(),
+                                    },
+                                )
+                            })
+                            .collect(),
+                    )
+                    .await
+                    .wrap_err("Backend exec env method failed")?
                 } else {
                     vfox.env_keys(&self.pathname, &tv.version, &opts.opts)
                         .await?

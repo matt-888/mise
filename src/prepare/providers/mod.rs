@@ -2,6 +2,7 @@ mod bun;
 mod bundler;
 mod composer;
 mod custom;
+mod git_submodule;
 mod go;
 mod npm;
 mod pip;
@@ -14,6 +15,7 @@ pub use bun::BunPrepareProvider;
 pub use bundler::BundlerPrepareProvider;
 pub use composer::ComposerPrepareProvider;
 pub use custom::CustomPrepareProvider;
+pub use git_submodule::GitSubmodulePrepareProvider;
 pub use go::GoPrepareProvider;
 pub use npm::NpmPrepareProvider;
 pub use pip::PipPrepareProvider;
@@ -50,5 +52,14 @@ impl ProviderBase {
 
     pub fn touch_outputs(&self) -> bool {
         self.config.touch_outputs.unwrap_or(true)
+    }
+
+    /// Returns the effective root directory for resolving sources/outputs.
+    /// When `dir` is set in config, returns `project_root/dir`; otherwise `project_root`.
+    pub fn config_root(&self) -> PathBuf {
+        match &self.config.dir {
+            Some(dir) => self.project_root.join(dir),
+            None => self.project_root.clone(),
+        }
     }
 }

@@ -1,6 +1,7 @@
 use crate::cli::args::ToolArg;
 use crate::cmd::CmdLineRunner;
 use crate::config::{Config, Settings, env_directive::EnvDirective};
+use crate::duration;
 use crate::file::{display_path, is_executable};
 use crate::task::task_context_builder::TaskContextBuilder;
 use crate::task::task_list::split_task_spec;
@@ -12,6 +13,7 @@ use crate::toolset::env_cache::CachedEnv;
 use crate::ui::{style, time};
 use duct::IntoExecutablePath;
 use eyre::{Report, Result, ensure, eyre};
+use indexmap::IndexMap;
 use itertools::Itertools;
 #[cfg(unix)]
 use nix::errno::Errno;
@@ -20,11 +22,30 @@ use std::iter::once;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio::sync::{mpsc, oneshot};
 use xx::file;
+
+/// Global lock for interactive task exclusivity.
+/// Interactive tasks acquire a write lock (exclusive), non-interactive tasks acquire a read lock (shared).
+static TASK_RUNTIME_LOCK: LazyLock<RwLock<()>> = LazyLock::new(|| RwLock::new(()));
+
+#[allow(dead_code)] // Guards are held for their Drop impl, not read
+enum RuntimeLockGuard<'a> {
+    Read(tokio::sync::RwLockReadGuard<'a, ()>),
+    Write(tokio::sync::RwLockWriteGuard<'a, ()>),
+}
+
+async fn acquire_runtime_lock(interactive: bool) -> RuntimeLockGuard<'static> {
+    if interactive {
+        RuntimeLockGuard::Write(TASK_RUNTIME_LOCK.write().await)
+    } else {
+        RuntimeLockGuard::Read(TASK_RUNTIME_LOCK.read().await)
+    }
+}
 
 /// Configuration for TaskExecutor
 pub struct TaskExecutorConfig {
@@ -161,13 +182,15 @@ impl TaskExecutor {
         let env_render_start = std::time::Instant::now();
 
         // Build environment - either from task's config file context or standard way
-        let (mut env, task_env) = if let Some(task_cf) = task_cf {
+        // extra_vars contains resolved vars from the task's config hierarchy (for monorepo tasks)
+        let (mut env, task_env, extra_vars) = if let Some(task_cf) = task_cf {
             self.context_builder
                 .resolve_task_env_with_config(config, task, task_cf, &ts)
                 .await?
         } else {
             // Fallback to standard behavior
-            task.render_env(config, &ts).await?
+            let (env, task_env) = task.render_env(config, &ts).await?;
+            (env, task_env, None)
         };
 
         trace!(
@@ -212,7 +235,8 @@ impl TaskExecutor {
 
         if let Some(file) = task.file_path(config).await? {
             let exec_start = std::time::Instant::now();
-            self.exec_file(config, &file, task, &env, &prefix).await?;
+            self.exec_file(config, &file, task, &env, &prefix, extra_vars)
+                .await?;
             trace!(
                 "task {} exec_file took {}ms (total {}ms)",
                 task.name,
@@ -221,7 +245,13 @@ impl TaskExecutor {
             );
         } else {
             let rendered_run_scripts = task
-                .render_run_scripts_with_args(config, self.cd.clone(), &task.args, &env)
+                .render_run_scripts_with_args(
+                    config,
+                    self.cd.clone(),
+                    &task.args,
+                    &env,
+                    extra_vars.clone(),
+                )
                 .await?;
 
             let get_args = || {
@@ -231,8 +261,16 @@ impl TaskExecutor {
                     .cloned()
                     .collect()
             };
-            self.parse_usage_spec_and_init_env(config, task, &mut env, get_args)
+            self.parse_usage_spec_and_init_env(config, task, &mut env, get_args, extra_vars)
                 .await?;
+
+            // For interactive tasks, acquire the lock before confirmation so the
+            // prompt gets exclusive terminal access (consistent with exec_file path).
+            let confirm_guard = if task.interactive {
+                Some(acquire_runtime_lock(task.interactive).await)
+            } else {
+                None
+            };
 
             // Check confirmation after usage args are parsed
             self.check_confirmation(config, task, &env).await?;
@@ -245,6 +283,7 @@ impl TaskExecutor {
                 &prefix,
                 rendered_run_scripts,
                 sched_tx,
+                confirm_guard,
             )
             .await?;
             trace!(
@@ -270,6 +309,7 @@ impl TaskExecutor {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn exec_task_run_entries(
         &self,
         config: &Arc<Config>,
@@ -278,19 +318,31 @@ impl TaskExecutor {
         prefix: &str,
         rendered_scripts: Vec<(String, Vec<String>)>,
         sched_tx: Arc<mpsc::UnboundedSender<(Task, Arc<Mutex<Deps>>)>>,
+        existing_guard: Option<RuntimeLockGuard<'static>>,
     ) -> Result<()> {
         let (env, task_env) = full_env;
         use crate::task::RunEntry;
         let mut script_iter = rendered_scripts.into_iter();
+        // Use an existing guard (e.g. from confirmation) or acquire a new one.
+        // The lock is held across consecutive script entries for exclusivity
+        // and temporarily dropped around inject_and_wait to avoid deadlocking.
+        let mut guard = match existing_guard {
+            Some(g) => Some(g),
+            None => Some(acquire_runtime_lock(task.interactive).await),
+        };
         for entry in task.run() {
             match entry {
                 RunEntry::Script(_) => {
                     if let Some((script, args)) = script_iter.next() {
+                        if guard.is_none() {
+                            guard = Some(acquire_runtime_lock(task.interactive).await);
+                        }
                         self.exec_script(&script, &args, task, env, prefix).await?;
                     }
                 }
                 RunEntry::SingleTask { task: spec } => {
                     let resolved_spec = crate::task::resolve_task_pattern(spec, Some(task));
+                    guard = None; // drop lock before waiting on sub-tasks
                     self.inject_and_wait(config, &[resolved_spec], task_env, sched_tx.clone())
                         .await?;
                 }
@@ -299,6 +351,7 @@ impl TaskExecutor {
                         .iter()
                         .map(|t| crate::task::resolve_task_pattern(t, Some(task)))
                         .collect();
+                    guard = None; // drop lock before waiting on sub-tasks
                     self.inject_and_wait(config, &resolved_tasks, task_env, sched_tx.clone())
                         .await?;
                 }
@@ -549,13 +602,23 @@ impl TaskExecutor {
         task: &Task,
         env: &BTreeMap<String, String>,
         prefix: &str,
+        extra_vars: Option<IndexMap<String, String>>,
     ) -> Result<()> {
         let mut env = env.clone();
         let command = file.to_string_lossy().to_string();
         let args = task.args.iter().cloned().collect_vec();
         let get_args = || once(command.clone()).chain(args.clone()).collect_vec();
-        self.parse_usage_spec_and_init_env(config, task, &mut env, get_args)
+        self.parse_usage_spec_and_init_env(config, task, &mut env, get_args, extra_vars)
             .await?;
+
+        // For interactive tasks, acquire the lock before confirmation so the
+        // prompt gets exclusive terminal access. For non-interactive tasks,
+        // acquire after confirmation to avoid blocking the task graph.
+        let guard = if task.interactive {
+            Some(acquire_runtime_lock(task.interactive).await)
+        } else {
+            None
+        };
 
         // Check confirmation after usage args are parsed
         self.check_confirmation(config, task, &env).await?;
@@ -569,6 +632,11 @@ impl TaskExecutor {
             self.eprint(task, prefix, &cmd);
         }
 
+        let _guard = if guard.is_some() {
+            guard
+        } else {
+            Some(acquire_runtime_lock(task.interactive).await)
+        };
         self.exec(file, &args, task, &env, prefix).await
     }
 
@@ -634,11 +702,19 @@ impl TaskExecutor {
             .redact(redactions.deref().clone())
             .raw(raw);
         if raw && !redactions.is_empty() {
-            hint!(
-                "raw_redactions",
-                "--raw will prevent mise from being able to use redactions",
-                ""
-            );
+            if task.interactive && !task.raw && !Settings::get().raw {
+                hint!(
+                    "interactive_redactions",
+                    "interactive tasks bypass redactions—secrets may appear in terminal output",
+                    ""
+                );
+            } else {
+                hint!(
+                    "raw_redactions",
+                    "--raw will prevent mise from being able to use redactions",
+                    ""
+                );
+            }
         }
         let output = self.output(Some(task));
         cmd.with_pass_signals();
@@ -768,7 +844,22 @@ impl TaskExecutor {
         if self.dry_run {
             return Ok(());
         }
-        cmd.execute()?;
+        let effective_timeout =
+            task.timeout
+                .as_ref()
+                .and_then(|s| match duration::parse_duration(s) {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        warn!("invalid timeout {:?} for task {}: {e}", s, task.name);
+                        None
+                    }
+                });
+        if let Some(timeout) = effective_timeout {
+            cmd = cmd.with_timeout(timeout);
+        }
+        // cmd.execute() is blocking (calls cp.wait()), so use block_in_place
+        // to avoid starving the tokio runtime while holding the TASK_RUNTIME_LOCK guard.
+        tokio::task::block_in_place(|| cmd.execute())?;
         trace!("{prefix} exited successfully");
         Ok(())
     }
@@ -828,8 +919,11 @@ impl TaskExecutor {
         task: &Task,
         env: &mut BTreeMap<String, String>,
         get_args: impl Fn() -> Vec<String>,
+        extra_vars: Option<IndexMap<String, String>>,
     ) -> Result<()> {
-        let (spec, _) = task.parse_usage_spec(config, self.cd.clone(), env).await?;
+        let (spec, _) = task
+            .parse_usage_spec_with_vars(config, self.cd.clone(), env, extra_vars)
+            .await?;
         if !spec.cmd.args.is_empty() || !spec.cmd.flags.is_empty() {
             let args: Vec<String> = get_args();
             trace!("Parsing usage spec for {:?}", args);

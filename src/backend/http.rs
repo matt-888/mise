@@ -29,7 +29,7 @@ const METADATA_FILE: &str = "metadata.json";
 
 /// Helper to get an option value with platform-specific fallback
 fn get_opt(opts: &ToolVersionOptions, key: &str) -> Option<String> {
-    lookup_platform_key(opts, key).or_else(|| opts.get(key).cloned())
+    lookup_platform_key(opts, key).or_else(|| opts.get(key).map(|s| s.to_string()))
 }
 
 /// Metadata stored alongside cached extractions
@@ -81,17 +81,21 @@ impl FileInfo {
             file_path.to_path_buf()
         };
 
-        let extension = effective_path
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
-
-        let format = file::TarFormat::from_ext(&extension);
-
         let file_name = effective_path.file_name().unwrap().to_string_lossy();
-        let is_compressed_binary = !file_name.contains(".tar")
-            && matches!(extension.as_str(), "gz" | "xz" | "bz2" | "zst");
+        let format = file::TarFormat::from_file_name(&file_name);
+
+        let extension = format
+            .extension()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                effective_path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string()
+            });
+
+        let is_compressed_binary = !format.is_archive() && format != file::TarFormat::Raw;
 
         Self {
             effective_path,
@@ -325,13 +329,14 @@ impl HttpBackend {
             pr.set_message(format!("extract {}", file_info.file_name()));
         }
 
-        match file_info.extension.as_str() {
-            "gz" => file::un_gz(file_path, &dest_file)?,
-            "xz" => file::un_xz(file_path, &dest_file)?,
-            "bz2" => file::un_bz2(file_path, &dest_file)?,
-            "zst" => file::un_zst(file_path, &dest_file)?,
-            _ => unreachable!(),
-        }
+        file::untar(
+            file_path,
+            &dest_file,
+            &file::TarOptions {
+                pr,
+                ..file::TarOptions::new(file_info.format)
+            },
+        )?;
 
         file::make_executable(&dest_file)?;
         Ok(ExtractionType::RawFile { filename })
@@ -393,11 +398,18 @@ impl HttpBackend {
 
         // Handle rename_exe option for archives
         if let Some(rename_to) = get_opt(opts, "rename_exe") {
+            // When bin_path is not explicitly set, auto-detect bin/ subdirectory to match
+            // the same logic used by discover_bin_paths() for PATH construction
             let search_dir = if let Some(bin_path_template) = get_opt(opts, "bin_path") {
                 let bin_path = template_string(&bin_path_template, tv);
                 dest.join(&bin_path)
             } else {
-                dest.to_path_buf()
+                let bin_dir = dest.join("bin");
+                if bin_dir.is_dir() {
+                    bin_dir
+                } else {
+                    dest.to_path_buf()
+                }
             };
             // rsplit('/') always yields at least one element (the full string if no delimiter)
             let tool_name = self.ba.tool_name.rsplit('/').next().unwrap();
@@ -512,7 +524,7 @@ impl HttpBackend {
     ) -> Result<()> {
         let settings = Settings::get();
         let filename = file_path.file_name().unwrap().to_string_lossy();
-        let lockfile_enabled = settings.lockfile;
+        let lockfile_enabled = settings.lockfile_enabled();
 
         let platform_key = self.get_platform_key();
         let platform_info = tv.lock_platforms.entry(platform_key).or_default();
@@ -559,13 +571,13 @@ impl HttpBackend {
         };
 
         let url = match opts.get("version_list_url") {
-            Some(url) => url.clone(),
+            Some(url) => url.to_string(),
             None => return Ok(vec![]),
         };
 
-        let regex = opts.get("version_regex").map(|s| s.as_str());
-        let json_path = opts.get("version_json_path").map(|s| s.as_str());
-        let version_expr = opts.get("version_expr").map(|s| s.as_str());
+        let regex = opts.get("version_regex");
+        let json_path = opts.get("version_json_path");
+        let version_expr = opts.get("version_expr");
 
         version_list::fetch_versions(&url, regex, json_path, version_expr).await
     }
@@ -652,7 +664,7 @@ impl Backend for HttpBackend {
 
         // For lockfile checksum verification
         let settings = Settings::get();
-        let lockfile_enabled = settings.lockfile;
+        let lockfile_enabled = settings.lockfile_enabled();
         let has_lockfile_checksum = tv
             .lock_platforms
             .get(&platform_key)

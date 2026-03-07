@@ -1,4 +1,3 @@
-use crate::cli::version::VERSION;
 use crate::config::config_file::mise_toml::EnvList;
 use crate::config::config_file::toml::{TrackingTomlParser, deserialize_arr};
 use crate::config::env_directive::{EnvDirective, EnvResolveOptions, EnvResults, ToolsFilter};
@@ -32,6 +31,12 @@ use xx::regex;
 
 static FUZZY_MATCHER: Lazy<SkimMatcherV2> =
     Lazy::new(|| SkimMatcherV2::default().use_cache(true).smart_case());
+static TASK_VARS_CACHE: Lazy<std::sync::Mutex<IndexMap<PathBuf, IndexMap<String, String>>>> =
+    Lazy::new(|| std::sync::Mutex::new(IndexMap::new()));
+
+pub(crate) fn reset() {
+    TASK_VARS_CACHE.lock().unwrap().clear();
+}
 
 /// Type alias for tracking failed tasks with their exit codes
 pub type FailedTasks = Arc<std::sync::Mutex<Vec<(Task, Option<i32>)>>>;
@@ -227,6 +232,8 @@ pub struct Task {
     pub wait_for: Vec<TaskDep>,
     #[serde(default)]
     pub env: EnvList,
+    #[serde(default)]
+    pub vars: EnvList,
     /// Env vars inherited from parent tasks at runtime (not used for task identity/deduplication)
     #[serde(skip)]
     pub inherited_env: EnvList,
@@ -238,6 +245,8 @@ pub struct Task {
     pub global: bool,
     #[serde(default)]
     pub raw: bool,
+    #[serde(default)]
+    pub interactive: bool,
     #[serde(default)]
     pub sources: Vec<String>,
     #[serde(default)]
@@ -306,25 +315,7 @@ impl Task {
         let info = file::read_to_string(path)?
             .lines()
             .filter_map(|line| {
-                debug_assert!(
-                    !VERSION.starts_with("2026.3"),
-                    "remove old syntax `# mise`"
-                );
-                if let Some(captures) =
-                    regex!(r"^(?:#|//|::)(?:MISE| ?\[MISE\]) ([a-z0-9_.-]+=[^\n]+)$").captures(line)
-                {
-                    Some(captures)
-                } else if let Some(captures) = regex!(r"^(?:#|//) mise ([a-z0-9_.-]+=[^\n]+)$")
-                    .captures(line)
-                {
-                    deprecated!(
-                        "file_task_headers_old_syntax",
-                        "The `# mise ...` syntax for task headers is deprecated and will be removed in mise 2026.3.0. Use the new `#MISE ...` syntax instead."
-                    );
-                    Some(captures)
-                } else {
-                    None
-                }
+                regex!(r"^(?:#|//|::)(?:MISE| ?\[MISE\]) ([a-z0-9_.-]+=[^\n]+)$").captures(line)
             })
             .map(|captures| captures.extract().1)
             .map(|[toml]| {
@@ -391,6 +382,7 @@ impl Task {
         task.dir = p.parse_str("dir");
         task.hide = !file::is_executable(path) || p.parse_bool("hide").unwrap_or_default();
         task.raw = p.parse_bool("raw").unwrap_or_default();
+        task.interactive = p.parse_bool("interactive").unwrap_or_default();
         task.sources = p.parse_array("sources").unwrap_or_default();
         task.outputs = p.get_raw("outputs").map(|to| to.into()).unwrap_or_default();
         task.file = Some(path.to_path_buf());
@@ -685,12 +677,12 @@ impl Task {
         }
         spec.cmd.usage = spec.cmd.usage();
     }
-
-    pub async fn parse_usage_spec(
+    pub async fn parse_usage_spec_with_vars(
         &self,
         config: &Arc<Config>,
         cwd: Option<PathBuf>,
         env: &EnvMap,
+        extra_vars: Option<IndexMap<String, String>>,
     ) -> Result<(usage::Spec, Vec<String>)> {
         let (mut spec, scripts) = if let Some(file) = self.file_path(config).await? {
             let spec = usage::Spec::parse_script(&file)
@@ -704,13 +696,24 @@ impl Task {
             (spec, vec![])
         } else {
             let scripts_only = self.run_script_strings();
-            let (scripts, spec) = TaskScriptParser::new(cwd)
+            let (scripts, spec) = Self::make_script_parser(cwd, extra_vars)
                 .parse_run_scripts(config, self, &scripts_only, env)
                 .await?;
             (spec, scripts)
         };
         self.populate_spec_metadata(&mut spec);
         Ok((spec, scripts))
+    }
+
+    fn make_script_parser(
+        cwd: Option<PathBuf>,
+        extra_vars: Option<IndexMap<String, String>>,
+    ) -> TaskScriptParser {
+        let parser = TaskScriptParser::new(cwd);
+        match extra_vars {
+            Some(vars) => parser.with_extra_vars(vars),
+            None => parser,
+        }
     }
 
     /// Parse usage spec for display purposes without expensive environment rendering
@@ -741,11 +744,14 @@ impl Task {
         cwd: Option<PathBuf>,
         args: &[String],
         env: &EnvMap,
+        extra_vars: Option<IndexMap<String, String>>,
     ) -> Result<Vec<(String, Vec<String>)>> {
-        let (spec, scripts) = self.parse_usage_spec(config, cwd.clone(), env).await?;
+        let (spec, scripts) = self
+            .parse_usage_spec_with_vars(config, cwd.clone(), env, extra_vars.clone())
+            .await?;
         if has_any_args_defined(&spec) {
             let scripts_only = self.run_script_strings();
-            let scripts = TaskScriptParser::new(cwd)
+            let scripts = Self::make_script_parser(cwd, extra_vars)
                 .parse_run_scripts_with_args(config, self, &scripts_only, env, args, &spec)
                 .await?;
             Ok(scripts.into_iter().map(|s| (s, vec![])).collect())
@@ -848,8 +854,83 @@ impl Task {
     pub async fn tera_ctx(&self, config: &Arc<Config>) -> Result<tera::Context> {
         let ts = config.get_toolset().await?;
         let mut tera_ctx = ts.tera_ctx(config).await?.clone();
+        let mut vars = self.resolve_base_vars(config).await?;
+        // Insert base vars first so that task-level var templates can reference them
+        // (e.g. a task var `foo = "{{vars.bar}}"` can read a config-level `bar`).
+        tera_ctx.insert("vars", &vars);
+        vars.extend(self.resolve_task_vars(config, ts, &tera_ctx).await?);
+        // Re-insert with task-level vars merged in so callers see the final combined map,
+        // with task-level values taking precedence over config-level ones.
+        tera_ctx.insert("vars", &vars);
         tera_ctx.insert("config_root", &self.config_root);
         Ok(tera_ctx)
+    }
+
+    async fn resolve_base_vars(&self, config: &Arc<Config>) -> Result<IndexMap<String, String>> {
+        let Some(task_cf) = self.cf(config) else {
+            return Ok(config.vars.clone());
+        };
+
+        if task_cf.project_root() == config.project_root {
+            return Ok(config.vars.clone());
+        }
+
+        let config_path = task_cf.get_path().to_path_buf();
+        if let Some(vars) = TASK_VARS_CACHE.lock().unwrap().get(&config_path) {
+            return Ok(vars.clone());
+        }
+
+        let task_dir = task_cf.get_path().parent().unwrap_or(task_cf.get_path());
+        let config_paths = crate::config::load_config_hierarchy_from_dir(task_dir)?;
+        let task_config_files = crate::config::load_config_files_from_paths(&config_paths).await?;
+        let vars_results =
+            crate::config::resolve_vars_from_config_files(config, &task_config_files).await?;
+        let vars: IndexMap<String, String> = vars_results
+            .vars
+            .iter()
+            .map(|(k, (v, _))| (k.clone(), v.clone()))
+            .collect();
+        TASK_VARS_CACHE
+            .lock()
+            .unwrap()
+            .insert(config_path, vars.clone());
+        Ok(vars)
+    }
+
+    async fn resolve_task_vars(
+        &self,
+        config: &Arc<Config>,
+        ts: &Toolset,
+        tera_ctx: &tera::Context,
+    ) -> Result<IndexMap<String, String>> {
+        if self.vars.0.is_empty() {
+            return Ok(IndexMap::new());
+        }
+
+        let env_map = ts.full_env(config).await?;
+        let results = EnvResults::resolve(
+            config,
+            tera_ctx.clone(),
+            &env_map,
+            self.vars
+                .0
+                .iter()
+                .cloned()
+                .map(|directive| (directive, self.config_source.clone()))
+                .collect(),
+            EnvResolveOptions {
+                vars: true,
+                tools: ToolsFilter::NonToolsOnly,
+                warn_on_missing_required: false,
+            },
+        )
+        .await?;
+
+        Ok(results
+            .vars
+            .iter()
+            .map(|(k, (v, _))| (k.clone(), v.clone()))
+            .collect())
     }
 
     pub fn cf<'a>(&'a self, config: &'a Config) -> Option<&'a Arc<dyn ConfigFile>> {
@@ -1161,11 +1242,13 @@ impl Default for Task {
             depends_post: vec![],
             wait_for: vec![],
             env: Default::default(),
+            vars: Default::default(),
             inherited_env: Default::default(),
             dir: None,
             hide: false,
             global: false,
             raw: false,
+            interactive: false,
             sources: vec![],
             outputs: Default::default(),
             raw_outputs: Default::default(),
@@ -1626,8 +1709,8 @@ echo "hello world"
         fs::write(
             &task_path,
             r#"#!/bin/bash
-# mise description="test task"
-# mise env={invalid=toml=here}
+#MISE description="test task"
+#MISE env={invalid=toml=here}
 echo "hello world"
 "#,
         )
@@ -2190,6 +2273,7 @@ echo "hello world"
 #MISE dir="/some/dir"
 #MISE hide=true
 #MISE raw=true
+#MISE interactive=true
 #MISE sources=["src1.txt", "src2.txt"]
 #MISE outputs=["out1.txt"]
 #MISE shell="bash -c"
@@ -2215,6 +2299,7 @@ echo "test"
         assert_eq!(task.dir, Some("/some/dir".to_string()));
         assert_eq!(task.hide, true);
         assert_eq!(task.raw, true);
+        assert_eq!(task.interactive, true);
         assert_eq!(task.sources, vec!["src1.txt", "src2.txt"]);
         assert_eq!(task.shell, Some("bash -c".to_string()));
         assert_eq!(task.quiet, true);

@@ -4,6 +4,42 @@
   "title": "mise-task-schema",
   "type": "object",
   "$defs": {
+    "task_dependency_item": {
+      "description": "task name and args",
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "task": {
+              "type": "string"
+            },
+            "args": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "env": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          },
+          "required": ["task"],
+          "additionalProperties": false
+        }
+      ]
+    },
     "task": {
       "oneOf": [
         {
@@ -50,18 +86,7 @@
                   "description": "task with args to run before this task",
                   "type": "array",
                   "items": {
-                    "description": "task name and args",
-                    "oneOf": [
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "type": "array",
-                        "items": {
-                          "type": "string"
-                        }
-                      }
-                    ]
+                    "$ref": "#/$defs/task_dependency_item"
                   }
                 }
               ]
@@ -76,18 +101,7 @@
                   "description": "task with args to run after this task",
                   "type": "array",
                   "items": {
-                    "description": "task name and args",
-                    "oneOf": [
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "type": "array",
-                        "items": {
-                          "type": "string"
-                        }
-                      }
-                    ]
+                    "$ref": "#/$defs/task_dependency_item"
                   }
                 }
               ]
@@ -101,8 +115,7 @@
                 {
                   "description": "task with args to wait for completion first",
                   "items": {
-                    "description": "task name and args",
-                    "type": "string"
+                    "$ref": "#/$defs/task_dependency_item"
                   },
                   "type": "array"
                 }
@@ -119,6 +132,9 @@
             },
             "env": {
               "$ref": "#/$defs/env"
+            },
+            "vars": {
+              "$ref": "#/$defs/vars"
             },
             "tools": {
               "description": "tools to install/activate before running this task",
@@ -215,6 +231,11 @@
                   "type": "string"
                 }
               ]
+            },
+            "interactive": {
+              "default": false,
+              "description": "mark task as interactive, acquiring exclusive terminal access while allowing other non-interactive tasks to run in parallel",
+              "type": "boolean"
             },
             "raw": {
               "default": false,
@@ -329,7 +350,8 @@
                 ],
                 "description": "require this environment variable to be defined before mise runs or in a later config file. Cannot be used with empty string values or value=false. Can be a boolean or a help string."
               }
-            }
+            },
+            "additionalProperties": false
           },
           {
             "type": "object",
@@ -722,18 +744,7 @@
               "description": "task with args to run before this task",
               "type": "array",
               "items": {
-                "description": "task name and args",
-                "oneOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  }
-                ]
+                "$ref": "#/$defs/task_dependency_item"
               }
             }
           ]
@@ -748,18 +759,7 @@
               "description": "task with args to run after this task",
               "type": "array",
               "items": {
-                "description": "task name and args",
-                "oneOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  }
-                ]
+                "$ref": "#/$defs/task_dependency_item"
               }
             }
           ]
@@ -773,8 +773,7 @@
             {
               "description": "task with args to wait for completion first",
               "items": {
-                "description": "task name and args",
-                "type": "string"
+                "$ref": "#/$defs/task_dependency_item"
               },
               "type": "array"
             }
@@ -791,6 +790,9 @@
         },
         "env": {
           "$ref": "#/$defs/env"
+        },
+        "vars": {
+          "$ref": "#/$defs/vars"
         },
         "tools": {
           "description": "tools to install/activate before running this task",
@@ -888,6 +890,11 @@
             }
           ]
         },
+        "interactive": {
+          "default": false,
+          "description": "mark task as interactive, acquiring exclusive terminal access while allowing other non-interactive tasks to run in parallel",
+          "type": "boolean"
+        },
         "raw": {
           "default": false,
           "description": "directly connect task to stdin/stdout/stderr",
@@ -954,6 +961,55 @@
       },
       "additionalProperties": false,
       "type": "object"
+    },
+    "vars": {
+      "description": "variables to set",
+      "type": "object",
+      "properties": {
+        "_": {
+          "description": "vars modules",
+          "additionalProperties": true,
+          "properties": {
+            "file": {
+              "oneOf": [
+                {
+                  "description": "dotenv file to load",
+                  "type": "string"
+                },
+                {
+                  "description": "dotenv files to load",
+                  "items": {
+                    "description": "dotenv file to load",
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              ]
+            },
+            "source": {
+              "oneOf": [
+                {
+                  "description": "bash script to load",
+                  "type": "string"
+                },
+                {
+                  "description": "bash scripts to load",
+                  "items": {
+                    "description": "bash script to load",
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              ]
+            }
+          },
+          "type": "object"
+        }
+      },
+      "additionalProperties": {
+        "description": "value of variable",
+        "type": "string"
+      }
     }
   },
   "description": "Config file for included mise tasks (https://mise.jdx.dev/tasks/#task-configuration)",

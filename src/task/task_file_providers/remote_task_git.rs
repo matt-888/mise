@@ -7,8 +7,10 @@ use async_trait::async_trait;
 
 use crate::{
     dirs, env,
+    file::display_path,
     git::{self, CloneOptions},
     hash,
+    lock_file::LockFile,
 };
 
 use super::TaskFileProvider;
@@ -123,25 +125,31 @@ impl TaskFileProvider for RemoteTaskGit {
 
         debug!("Repo structure: {:?}", repo_structure);
 
-        match self.is_cached {
-            true => {
-                trace!("Cache mode enabled");
+        let _lock = LockFile::new(&destination)
+            .with_callback(|l| {
+                debug!(
+                    "waiting for lock on remote git task cache: {}",
+                    display_path(l)
+                );
+            })
+            .lock()?;
 
-                if full_path.exists() {
-                    debug!("Using cached file: {:?}", full_path);
-                    return Ok(full_path);
-                }
+        if self.is_cached {
+            trace!("Cache mode enabled");
+            if full_path.exists() {
+                debug!("Using cached file: {:?}", full_path);
+                return Ok(full_path);
             }
-            false => {
-                trace!("Cache mode disabled");
-
-                if full_path.exists() {
-                    crate::file::remove_all(&destination)?;
-                }
-            }
+        } else {
+            trace!("Cache mode disabled");
         }
 
-        let git_repo = git::Git::new(destination);
+        let tmp_destination = self.storage_path.join(format!("{}.clone-tmp", &cache_key));
+        if tmp_destination.exists() {
+            crate::file::remove_all(&tmp_destination)?;
+        }
+
+        let git_repo = git::Git::new(&tmp_destination);
 
         let mut clone_options = CloneOptions::default();
 
@@ -150,7 +158,27 @@ impl TaskFileProvider for RemoteTaskGit {
             clone_options = clone_options.branch(branch);
         }
 
-        git_repo.clone(repo_structure.url_without_path.as_str(), clone_options)?;
+        match git_repo.clone(repo_structure.url_without_path.as_str(), clone_options) {
+            Ok(()) => {
+                if destination.exists()
+                    && let Err(e) = crate::file::remove_all(&destination)
+                {
+                    let _ = crate::file::remove_all(&tmp_destination);
+                    return Err(e);
+                }
+                if let Err(e) = std::fs::rename(&tmp_destination, &destination) {
+                    let _ = crate::file::remove_all(&tmp_destination);
+                    return Err(eyre::eyre!(
+                        "failed to move cloned repo into cache at {}: {e}",
+                        display_path(&destination)
+                    ));
+                }
+            }
+            Err(e) => {
+                let _ = crate::file::remove_all(&tmp_destination);
+                return Err(e);
+            }
+        }
 
         Ok(full_path)
     }

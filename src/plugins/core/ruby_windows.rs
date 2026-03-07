@@ -6,6 +6,7 @@ use std::{
 
 use crate::backend::Backend;
 use crate::backend::VersionInfo;
+use crate::backend::normalize_idiomatic_contents;
 use crate::cli::args::BackendArg;
 use crate::cmd::CmdLineRunner;
 use crate::config::{Config, Settings};
@@ -111,11 +112,7 @@ impl RubyPlugin {
     }
 
     async fn download(&self, tv: &ToolVersion, pr: &dyn SingleReport) -> Result<PathBuf> {
-        let arch = arch();
-        let url = format!(
-            "https://github.com/oneclick/rubyinstaller2/releases/download/RubyInstaller-{version}-1/rubyinstaller-{version}-1-{arch}.7z",
-            version = tv.version,
-        );
+        let url = super::ruby_common::rubyinstaller_url(&tv.version);
         let filename = url.split('/').next_back().unwrap();
         let tarball_path = tv.download_path().join(filename);
 
@@ -181,23 +178,26 @@ impl Backend for RubyPlugin {
         Ok(versions)
     }
 
-    async fn idiomatic_filenames(&self) -> Result<Vec<String>> {
+    async fn _idiomatic_filenames(&self) -> Result<Vec<String>> {
         Ok(vec![".ruby-version".into(), "Gemfile".into()])
     }
 
-    async fn parse_idiomatic_file(&self, path: &Path) -> Result<String> {
+    async fn _parse_idiomatic_file(&self, path: &Path) -> Result<Vec<String>> {
         let v = match path.file_name() {
             Some(name) if name == "Gemfile" => parse_gemfile(&file::read_to_string(path)?),
             _ => {
                 // .ruby-version
-                let body = file::read_to_string(path)?;
+                let body = normalize_idiomatic_contents(&file::read_to_string(path)?);
                 body.trim()
                     .trim_start_matches("ruby-")
                     .trim_start_matches('v')
                     .to_string()
             }
         };
-        Ok(v)
+        if v.is_empty() {
+            return Ok(vec![]);
+        }
+        Ok(vec![v])
     }
 
     async fn install_version_(

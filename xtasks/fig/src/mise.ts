@@ -1696,6 +1696,11 @@ const completionSpec: Fig.Spec = {
           isRepeatable: false,
         },
         {
+          name: "--local",
+          description: "Only show outdated tools defined in local config files",
+          isRepeatable: false,
+        },
+        {
           name: "--no-header",
           description: "Don't show table header",
           isRepeatable: false,
@@ -1787,6 +1792,12 @@ const completionSpec: Fig.Spec = {
           name: ["ls", "list"],
           description: "List installed plugins",
           options: [
+            {
+              name: ["-o", "--outdated"],
+              description:
+                "Show plugins with available updates\nChecks the remote for newer versions and only displays plugins that are outdated",
+              isRepeatable: false,
+            },
             {
               name: ["-u", "--urls"],
               description:
@@ -1886,18 +1897,24 @@ const completionSpec: Fig.Spec = {
       description: "[experimental] Ensure project dependencies are ready",
       options: [
         {
+          name: "--explain",
+          description:
+            "Show why a provider is fresh or stale (requires a provider argument)",
+          isRepeatable: false,
+        },
+        {
           name: ["-f", "--force"],
           description: "Force run all prepare steps even if outputs are fresh",
           isRepeatable: false,
         },
         {
-          name: "--list",
-          description: "Show what prepare steps are available",
+          name: ["-n", "--dry-run"],
+          description: "Only check if prepare is needed, don't run commands",
           isRepeatable: false,
         },
         {
-          name: ["-n", "--dry-run"],
-          description: "Only check if prepare is needed, don't run commands",
+          name: "--list",
+          description: "Show what prepare steps are available",
           isRepeatable: false,
         },
         {
@@ -1917,6 +1934,12 @@ const completionSpec: Fig.Spec = {
           },
         },
       ],
+      args: {
+        name: "provider",
+        description:
+          "Provider to operate on (runs only this provider, or use with --explain)",
+        isOptional: true,
+      },
     },
     {
       name: "prune",
@@ -3361,6 +3384,11 @@ const completionSpec: Fig.Spec = {
           name: "--dry-run-code",
           description:
             "Like --dry-run but exits with code 1 if there are outdated tools",
+          isRepeatable: false,
+        },
+        {
+          name: "--local",
+          description: "Only upgrade tools defined in local config files",
           isRepeatable: false,
         },
         {

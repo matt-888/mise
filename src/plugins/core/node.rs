@@ -1,6 +1,8 @@
 use crate::backend::VersionInfo;
 use crate::backend::static_helpers::fetch_checksum_from_shasums;
-use crate::backend::{Backend, VersionCacheManager, platform_target::PlatformTarget};
+use crate::backend::{
+    Backend, VersionCacheManager, normalize_idiomatic_contents, platform_target::PlatformTarget,
+};
 use crate::build_time::built_info;
 use crate::cache::CacheManagerBuilder;
 use crate::cli::args::BackendArg;
@@ -114,10 +116,9 @@ impl NodePlugin {
                     &opts.binary_tarball_path,
                     &opts.install_path,
                     &TarOptions {
-                        format: TarFormat::TarGz,
                         strip_components: 1,
                         pr: Some(ctx.pr.as_ref()),
-                        ..Default::default()
+                        ..TarOptions::new(TarFormat::TarGz)
                     },
                 )?;
                 Ok(())
@@ -186,9 +187,8 @@ impl NodePlugin {
             &opts.source_tarball_path,
             opts.build_dir.parent().unwrap(),
             &TarOptions {
-                format: TarFormat::TarGz,
                 pr: Some(ctx.pr.as_ref()),
-                ..Default::default()
+                ..TarOptions::new(TarFormat::TarGz)
             },
         )?;
         self.exec_configure(ctx, opts)?;
@@ -562,7 +562,7 @@ impl Backend for NodePlugin {
         Ok(aliases)
     }
 
-    async fn idiomatic_filenames(&self) -> Result<Vec<String>> {
+    async fn _idiomatic_filenames(&self) -> Result<Vec<String>> {
         Ok(vec![
             ".node-version".into(),
             ".nvmrc".into(),
@@ -570,21 +570,19 @@ impl Backend for NodePlugin {
         ])
     }
 
-    async fn parse_idiomatic_file(&self, path: &Path) -> Result<String> {
-        if path.file_name().is_some_and(|f| f == "package.json") {
-            let pkg = crate::package_json::PackageJson::parse(path)?;
-            return pkg
-                .runtime_version("node")
-                .ok_or_else(|| eyre::eyre!("no node version found in package.json"));
-        }
-        let body = file::read_to_string(path)?;
-        // strip comments
-        let body = body.split('#').next().unwrap_or_default().to_string();
-        // trim "v" prefix
-        let body = body.trim().strip_prefix('v').unwrap_or(&body);
-        // replace lts/* with lts
-        let body = body.replace("lts/*", "lts");
-        Ok(body)
+    async fn _parse_idiomatic_file(&self, path: &Path) -> Result<Vec<String>> {
+        let contents = file::read_to_string(path)?;
+        let body = normalize_idiomatic_contents(&contents);
+
+        let versions = body
+            .lines()
+            .map(|line| {
+                let mut version = line.trim().strip_prefix('v').unwrap_or(line).to_string();
+                version = version.replace("lts/*", "lts");
+                version
+            })
+            .collect();
+        Ok(versions)
     }
 
     async fn install_version_(
@@ -701,8 +699,9 @@ impl Backend for NodePlugin {
             opts.insert("compile".to_string(), "true".to_string());
         }
 
-        // Flavor affects which binary variant is downloaded (only if set)
-        if is_current_platform && let Some(flavor) = settings.node.flavor.clone() {
+        // Flavor affects which binary variant is downloaded
+        // Apply to all platforms to avoid splitting lockfile entries (#8390)
+        if let Some(flavor) = settings.node.flavor.clone() {
             opts.insert("flavor".to_string(), flavor);
         }
 

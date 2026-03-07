@@ -73,7 +73,7 @@ impl SwiftPlugin {
                     .path()
                     .to_path_buf()
             };
-            CmdLineRunner::new("pkgutil")
+            CmdLineRunner::new(pkgutil_path())
                 .arg("--expand-full")
                 .arg(tarball_path)
                 .arg(&tmp)
@@ -92,10 +92,9 @@ impl SwiftPlugin {
                 tarball_path,
                 &tv.install_path(),
                 &file::TarOptions {
-                    format: file::TarFormat::TarGz,
-                    pr: Some(ctx.pr.as_ref()),
                     strip_components: 1,
-                    ..Default::default()
+                    pr: Some(ctx.pr.as_ref()),
+                    ..file::TarOptions::new(file::TarFormat::TarGz)
                 },
             )?;
         }
@@ -153,6 +152,53 @@ impl SwiftPlugin {
     }
 }
 
+#[cfg(macos)]
+fn pkgutil_path() -> PathBuf {
+    resolve_pkgutil_path(file::which("pkgutil"))
+}
+
+#[cfg(not(macos))]
+fn pkgutil_path() -> PathBuf {
+    PathBuf::from("pkgutil")
+}
+
+#[cfg(macos)]
+fn resolve_pkgutil_path(which_result: Option<PathBuf>) -> PathBuf {
+    if let Some(path) = which_result {
+        return path;
+    }
+    let fallback = PathBuf::from("/usr/sbin/pkgutil");
+    if file::is_executable(&fallback) {
+        fallback
+    } else {
+        PathBuf::from("pkgutil")
+    }
+}
+
+#[cfg(all(test, macos))]
+mod tests {
+    use super::resolve_pkgutil_path;
+    use crate::file;
+    use std::path::PathBuf;
+
+    #[test]
+    fn resolve_pkgutil_path_prefers_discovered_path() {
+        let discovered = PathBuf::from("/tmp/custom/pkgutil");
+        assert_eq!(resolve_pkgutil_path(Some(discovered.clone())), discovered);
+    }
+
+    #[test]
+    fn resolve_pkgutil_path_falls_back_to_system_location() {
+        let resolved = resolve_pkgutil_path(None);
+        let fallback = PathBuf::from("/usr/sbin/pkgutil");
+        if file::is_executable(&fallback) {
+            assert_eq!(resolved, fallback);
+        } else {
+            assert_eq!(resolved, PathBuf::from("pkgutil"));
+        }
+    }
+}
+
 #[async_trait]
 impl Backend for SwiftPlugin {
     fn ba(&self) -> &Arc<BackendArg> {
@@ -194,7 +240,7 @@ impl Backend for SwiftPlugin {
         Ok(versions)
     }
 
-    async fn idiomatic_filenames(&self) -> Result<Vec<String>> {
+    async fn _idiomatic_filenames(&self) -> Result<Vec<String>> {
         if Settings::get().experimental {
             Ok(vec![".swift-version".into()])
         } else {

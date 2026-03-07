@@ -4,6 +4,42 @@
   "title": "mise",
   "type": "object",
   "$defs": {
+    "task_dependency_item": {
+      "description": "task name and args",
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        {
+          "type": "object",
+          "properties": {
+            "task": {
+              "type": "string"
+            },
+            "args": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "env": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          },
+          "required": ["task"],
+          "additionalProperties": false
+        }
+      ]
+    },
     "env_directive": {
       "type": "object",
       "properties": {
@@ -109,7 +145,8 @@
                 ],
                 "description": "require this environment variable to be defined before mise runs or in a later config file. Cannot be used with empty string values or value=false. Can be a boolean or a help string."
               }
-            }
+            },
+            "additionalProperties": false
           },
           {
             "type": "object",
@@ -607,6 +644,19 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
+            "cli_telemetry_optout": {
+              "description": "Set DOTNET_CLI_TELEMETRY_OPTOUT to opt out of .NET CLI telemetry.",
+              "type": "boolean"
+            },
+            "dotnet_root": {
+              "description": "Path to the shared .NET SDK root directory.",
+              "type": "string"
+            },
+            "isolated": {
+              "default": false,
+              "description": "Install each .NET SDK version in its own isolated directory.",
+              "type": "boolean"
+            },
             "package_flags": {
               "default": [],
               "description": "Extends dotnet search and install abilities.",
@@ -858,7 +908,6 @@
           "type": "boolean"
         },
         "lockfile": {
-          "default": true,
           "description": "Create and read lockfiles for tool versions.",
           "type": "boolean"
         },
@@ -1095,11 +1144,6 @@
                 "type": "string"
               }
             },
-            "venv_auto_create": {
-              "description": "Automatically create virtualenvs for python tools.",
-              "type": "boolean",
-              "deprecated": true
-            },
             "venv_create_args": {
               "description": "Arguments to pass to python when creating a venv. (not used for uv venv creation)",
               "type": "array",
@@ -1146,11 +1190,6 @@
         "python_pyenv_repo": {
           "description": "URL to fetch pyenv from for compiling python.",
           "type": "string",
-          "deprecated": true
-        },
-        "python_venv_auto_create": {
-          "description": "Automatically create virtualenvs for python tools.",
-          "type": "boolean",
           "deprecated": true
         },
         "python_venv_stdlib": {
@@ -1656,18 +1695,7 @@
                   "description": "task with args to run before this task",
                   "type": "array",
                   "items": {
-                    "description": "task name and args",
-                    "oneOf": [
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "type": "array",
-                        "items": {
-                          "type": "string"
-                        }
-                      }
-                    ]
+                    "$ref": "#/$defs/task_dependency_item"
                   }
                 }
               ]
@@ -1682,18 +1710,7 @@
                   "description": "task with args to run after this task",
                   "type": "array",
                   "items": {
-                    "description": "task name and args",
-                    "oneOf": [
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "type": "array",
-                        "items": {
-                          "type": "string"
-                        }
-                      }
-                    ]
+                    "$ref": "#/$defs/task_dependency_item"
                   }
                 }
               ]
@@ -1707,8 +1724,7 @@
                 {
                   "description": "task with args to wait for completion first",
                   "items": {
-                    "description": "task name and args",
-                    "type": "string"
+                    "$ref": "#/$defs/task_dependency_item"
                   },
                   "type": "array"
                 }
@@ -1725,6 +1741,9 @@
             },
             "env": {
               "$ref": "#/$defs/env"
+            },
+            "vars": {
+              "$ref": "#/$defs/vars"
             },
             "tools": {
               "description": "tools to install/activate before running this task",
@@ -1821,6 +1840,11 @@
                   "type": "string"
                 }
               ]
+            },
+            "interactive": {
+              "default": false,
+              "description": "mark task as interactive, acquiring exclusive terminal access while allowing other non-interactive tasks to run in parallel",
+              "type": "boolean"
             },
             "raw": {
               "default": false,
@@ -2063,14 +2087,6 @@
             "type": "string"
           },
           {
-            "description": "script to run",
-            "items": {
-              "description": "script to run",
-              "type": "string"
-            },
-            "type": "array"
-          },
-          {
             "additionalProperties": false,
             "properties": {
               "script": {
@@ -2085,20 +2101,50 @@
             "type": "object"
           },
           {
-            "description": "scripts to run",
+            "additionalProperties": false,
+            "properties": {
+              "task": {
+                "description": "mise task to run",
+                "type": "string"
+              }
+            },
+            "required": ["task"],
+            "type": "object"
+          },
+          {
+            "description": "scripts/tasks to run",
             "items": {
-              "additionalProperties": false,
-              "properties": {
-                "script": {
+              "oneOf": [
+                {
                   "description": "script to run",
                   "type": "string"
                 },
-                "shell": {
-                  "description": "specify the shell to run the script inside of",
-                  "type": "string"
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "script": {
+                      "description": "script to run",
+                      "type": "string"
+                    },
+                    "shell": {
+                      "description": "specify the shell to run the script inside of",
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "task": {
+                      "description": "mise task to run",
+                      "type": "string"
+                    }
+                  },
+                  "required": ["task"],
+                  "type": "object"
                 }
-              },
-              "type": "object"
+              ]
             },
             "type": "array"
           }
@@ -2117,6 +2163,10 @@
             "type": "string",
             "description": "script to run when file changes"
           },
+          "task": {
+            "type": "string",
+            "description": "mise task to run when file changes"
+          },
           "patterns": {
             "type": "array",
             "description": "patterns to watch for",
@@ -2124,7 +2174,15 @@
               "type": "string"
             }
           }
-        }
+        },
+        "oneOf": [
+          {
+            "required": ["run"]
+          },
+          {
+            "required": ["task"]
+          }
+        ]
       }
     },
     "prepare_provider": {
@@ -2181,6 +2239,22 @@
         "description": {
           "type": "string",
           "description": "Description shown in output"
+        },
+        "depends": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Other prepare providers that must complete before this one runs"
+        },
+        "touch_outputs": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether to update mtime of output files/dirs after a successful run"
+        },
+        "timeout": {
+          "type": "string",
+          "description": "Timeout for the run command (e.g., \"30s\", \"5m\", \"1h\")"
         }
       },
       "additionalProperties": false,
@@ -2219,18 +2293,7 @@
               "description": "task with args to run before this task",
               "type": "array",
               "items": {
-                "description": "task name and args",
-                "oneOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  }
-                ]
+                "$ref": "#/$defs/task_dependency_item"
               }
             }
           ]
@@ -2245,18 +2308,7 @@
               "description": "task with args to run after this task",
               "type": "array",
               "items": {
-                "description": "task name and args",
-                "oneOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  }
-                ]
+                "$ref": "#/$defs/task_dependency_item"
               }
             }
           ]
@@ -2270,8 +2322,7 @@
             {
               "description": "task with args to wait for completion first",
               "items": {
-                "description": "task name and args",
-                "type": "string"
+                "$ref": "#/$defs/task_dependency_item"
               },
               "type": "array"
             }
@@ -2288,6 +2339,9 @@
         },
         "env": {
           "$ref": "#/$defs/env"
+        },
+        "vars": {
+          "$ref": "#/$defs/vars"
         },
         "tools": {
           "description": "tools to install/activate before running this task",
@@ -2384,6 +2438,11 @@
               "type": "string"
             }
           ]
+        },
+        "interactive": {
+          "default": false,
+          "description": "mark task as interactive, acquiring exclusive terminal access while allowing other non-interactive tasks to run in parallel",
+          "type": "boolean"
         },
         "raw": {
           "default": false,
@@ -2484,18 +2543,7 @@
               "description": "task with args to run before this task",
               "type": "array",
               "items": {
-                "description": "task name and args",
-                "oneOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  }
-                ]
+                "$ref": "#/$defs/task_dependency_item"
               }
             }
           ]
@@ -2510,18 +2558,7 @@
               "description": "task with args to run after this task",
               "type": "array",
               "items": {
-                "description": "task name and args",
-                "oneOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
-                  }
-                ]
+                "$ref": "#/$defs/task_dependency_item"
               }
             }
           ]
@@ -2535,8 +2572,7 @@
             {
               "description": "task with args to wait for completion first",
               "items": {
-                "description": "task name and args",
-                "type": "string"
+                "$ref": "#/$defs/task_dependency_item"
               },
               "type": "array"
             }
@@ -2553,6 +2589,9 @@
         },
         "env": {
           "$ref": "#/$defs/env"
+        },
+        "vars": {
+          "$ref": "#/$defs/vars"
         },
         "tools": {
           "description": "tools to install/activate before running this task",
@@ -2649,6 +2688,11 @@
               "type": "string"
             }
           ]
+        },
+        "interactive": {
+          "default": false,
+          "description": "mark task as interactive, acquiring exclusive terminal access while allowing other non-interactive tasks to run in parallel",
+          "type": "boolean"
         },
         "raw": {
           "default": false,

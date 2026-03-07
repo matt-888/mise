@@ -7,6 +7,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use crate::backend::VersionInfo;
 use crate::backend::backend_type::BackendType;
 use crate::backend::external_plugin_cache::ExternalPluginCache;
+use crate::backend::normalize_idiomatic_contents;
 use crate::cache::{CacheManager, CacheManagerBuilder};
 use crate::cli::args::BackendArg;
 use crate::config::{Config, Settings};
@@ -169,11 +170,11 @@ impl AsdfBackend {
         tv: &ToolVersion,
     ) -> Result<ScriptManager> {
         let mut sm = self.plugin.script_man.clone();
-        for (key, value) in tv.request.options().opts {
+        for (key, value) in tv.request.options().opts_as_strings() {
             let k = format!("RTX_TOOL_OPTS__{}", key.to_uppercase());
             sm = sm.with_env(k, value.clone());
             let k = format!("MISE_TOOL_OPTS__{}", key.to_uppercase());
-            sm = sm.with_env(k, value.clone());
+            sm = sm.with_env(k, value);
         }
         for (key, value) in tv.request.options().install_env {
             sm = sm.with_env(key, value.clone());
@@ -307,7 +308,7 @@ impl Backend for AsdfBackend {
         Ok(aliases)
     }
 
-    async fn idiomatic_filenames(&self) -> Result<Vec<String>> {
+    async fn _idiomatic_filenames(&self) -> Result<Vec<String>> {
         if let Some(data) = &self.toml.list_idiomatic_filenames.data {
             return Ok(self.plugin.parse_idiomatic_filenames(data));
         }
@@ -325,9 +326,9 @@ impl Backend for AsdfBackend {
             .cloned()
     }
 
-    async fn parse_idiomatic_file(&self, idiomatic_file: &Path) -> Result<String> {
+    async fn _parse_idiomatic_file(&self, idiomatic_file: &Path) -> Result<Vec<String>> {
         if let Some(cached) = self.fetch_cached_idiomatic_file(idiomatic_file)? {
-            return Ok(cached);
+            return Ok(cached.split_whitespace().map(|s| s.to_string()).collect());
         }
         trace!(
             "parsing idiomatic file: {}",
@@ -338,11 +339,17 @@ impl Backend for AsdfBackend {
             true => self.plugin.script_man.read(&script)?,
             false => fs::read_to_string(idiomatic_file)?,
         }
-        .trim()
         .to_string();
+        let idiomatic_version = normalize_idiomatic_contents(&idiomatic_version);
 
         self.write_idiomatic_cache(idiomatic_file, &idiomatic_version)?;
-        Ok(idiomatic_version)
+        if idiomatic_version.is_empty() {
+            return Ok(vec![]);
+        }
+        Ok(idiomatic_version
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect())
     }
 
     fn plugin(&self) -> Option<&PluginEnum> {

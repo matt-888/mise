@@ -6,6 +6,7 @@ use crate::task::Task;
 use crate::tera::get_tera;
 use eyre::{Context, Result};
 use heck::ToSnakeCase;
+use indexmap::IndexMap;
 use itertools::Itertools;
 use std::collections::{HashMap, HashSet};
 use std::iter::once;
@@ -21,15 +22,41 @@ type TeraSpecParsingResult = (
 
 pub struct TaskScriptParser {
     dir: Option<PathBuf>,
+    /// Extra vars to inject into the tera context (for monorepo task vars resolution)
+    extra_vars: Option<IndexMap<String, String>>,
 }
 
 impl TaskScriptParser {
     pub fn new(dir: Option<PathBuf>) -> Self {
-        TaskScriptParser { dir }
+        TaskScriptParser {
+            dir,
+            extra_vars: None,
+        }
+    }
+
+    pub fn with_extra_vars(mut self, vars: IndexMap<String, String>) -> Self {
+        self.extra_vars = Some(vars);
+        self
     }
 
     fn get_tera(&self) -> tera::Tera {
         get_tera(self.dir.as_deref())
+    }
+
+    /// Inject extra vars (from monorepo task config hierarchy) into the tera context
+    fn inject_extra_vars(&self, tera_ctx: &mut tera::Context) {
+        if let Some(extra_vars) = &self.extra_vars {
+            // Merge extra_vars (base config-level vars from the config hierarchy) with any
+            // vars already set in the context by task.tera_ctx() (which includes per-task
+            // vars). Per-task vars take precedence over config-level vars.
+            let existing: IndexMap<String, String> = tera_ctx
+                .get("vars")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            let mut merged = extra_vars.clone();
+            merged.extend(existing);
+            tera_ctx.insert("vars", &merged);
+        }
     }
 
     fn render_script_with_context(
@@ -615,6 +642,7 @@ impl TaskScriptParser {
     ) -> Result<(Vec<String>, usage::Spec)> {
         let (mut tera, arg_order, input_args, input_flags) = self.setup_tera_for_spec_parsing(task);
         let mut tera_ctx = task.tera_ctx(config).await?;
+        self.inject_extra_vars(&mut tera_ctx);
         tera_ctx.insert("env", &env);
         // First render the usage field to collect the spec and build a default
         // usage map, so that `{{ usage.* }}` references in run scripts do not
@@ -752,6 +780,7 @@ impl TaskScriptParser {
             tera.register_function("option", flag_func("".to_string()));
             tera.register_function("flag", flag_func(false.to_string()));
             let mut tera_ctx = task.tera_ctx(config).await?;
+            self.inject_extra_vars(&mut tera_ctx);
             tera_ctx.insert("env", &env);
             tera_ctx.insert("usage", &Self::make_usage_ctx(&m));
             out.push(Self::render_script_with_context(

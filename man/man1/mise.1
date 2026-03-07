@@ -1462,6 +1462,12 @@ show other 20.x versions, not 21.x or 22.x versions.
 
 Using this flag, if there are 21.x or newer versions it will display those instead of 20.x.
 .TP
+\fB\-\-local\fR
+Only show outdated tools defined in local config files
+
+This will only show tools that are defined in project\-local mise.toml and
+will skip tools defined in the global config (~/.config/mise/config.toml).
+.TP
 \fB\-\-no\-header\fR
 Don't show table header
 \fBArguments:\fR
@@ -1577,6 +1583,10 @@ Same as `mise plugins ls\-remote`
 The built\-in plugins only
 Normally these are not shown
 .TP
+\fB\-o, \-\-outdated\fR
+Show plugins with available updates
+Checks the remote for newer versions and only displays plugins that are outdated
+.TP
 \fB\-u, \-\-urls\fR
 Show the git url for each plugin
 e.g.: https://github.com/mise\-plugins/vfox\-cmake.git
@@ -1655,25 +1665,33 @@ if needed.
 Providers with `auto = true` are automatically invoked before `mise x` and `mise run`
 unless skipped with the \-\-no\-prepare flag.
 .PP
-\fBUsage:\fR mise prepare [OPTIONS]
+\fBUsage:\fR mise prepare [OPTIONS] [<PROVIDER>]
 .PP
 \fBOptions:\fR
 .PP
 .TP
+\fB\-\-explain\fR
+Show why a provider is fresh or stale (requires a provider argument)
+.TP
 \fB\-f, \-\-force\fR
 Force run all prepare steps even if outputs are fresh
 .TP
-\fB\-\-list\fR
-Show what prepare steps are available
-.TP
 \fB\-n, \-\-dry\-run\fR
 Only check if prepare is needed, don't run commands
+.TP
+\fB\-\-list\fR
+Show what prepare steps are available
 .TP
 \fB\-\-only\fR \fI<ONLY>\fR
 Run specific prepare rule(s) only
 .TP
 \fB\-\-skip\fR \fI<SKIP>\fR
 Skip specific prepare rule(s)
+\fBArguments:\fR
+.PP
+.TP
+\fB<PROVIDER>\fR
+Provider to operate on (runs only this provider, or use with \-\-explain)
 .SH "MISE PRUNE"
 Delete unused versions of tools
 
@@ -2904,6 +2922,12 @@ Explicitly pinned versions like "22.5.0" are not filtered.
 Like \-\-dry\-run but exits with code 1 if there are outdated tools
 
 This is useful for scripts to check if tools need to be upgraded.
+.TP
+\fB\-\-local\fR
+Only upgrade tools defined in local config files
+
+This will only upgrade tools that are defined in project\-local mise.toml and
+will skip tools defined in the global config (~/.config/mise/config.toml).
 .TP
 \fB\-\-raw\fR
 Directly pipe stdin/stdout/stderr from plugin to user Sets \-\-jobs=1

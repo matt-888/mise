@@ -4,7 +4,7 @@ use std::fs::{self};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::backend::{Backend, VersionInfo};
+use crate::backend::{Backend, VersionInfo, normalize_idiomatic_contents};
 use crate::cache::{CacheManager, CacheManagerBuilder};
 use crate::cli::args::BackendArg;
 use crate::cli::version::OS;
@@ -140,9 +140,10 @@ impl JavaPlugin {
                 tarball_path,
                 &tv.download_path(),
                 &TarOptions {
-                    format: TarFormat::Auto,
                     pr: Some(pr),
-                    ..Default::default()
+                    ..TarOptions::new(TarFormat::from_file_name(
+                        &tarball_path.file_name().unwrap().to_string_lossy(),
+                    ))
                 },
             )?,
         }
@@ -243,7 +244,7 @@ impl JavaPlugin {
         tv.request
             .options()
             .get("release_type")
-            .cloned()
+            .map(|s| s.to_string())
             .unwrap_or(String::from("ga"))
     }
 
@@ -303,7 +304,7 @@ impl Backend for JavaPlugin {
             .list_tools()
             .iter()
             .find(|ba| ba.short == "java")
-            .and_then(|ba| ba.opts().get("release_type").cloned())
+            .and_then(|ba| ba.opts().get("release_type").map(|s| s.to_string()))
             .unwrap_or_else(|| "ga".to_string());
 
         let versions = self
@@ -386,11 +387,11 @@ impl Backend for JavaPlugin {
         Ok(aliases)
     }
 
-    async fn idiomatic_filenames(&self) -> Result<Vec<String>> {
+    async fn _idiomatic_filenames(&self) -> Result<Vec<String>> {
         Ok(vec![".java-version".into(), ".sdkmanrc".into()])
     }
 
-    async fn parse_idiomatic_file(&self, path: &Path) -> Result<String> {
+    async fn _parse_idiomatic_file(&self, path: &Path) -> Result<Vec<String>> {
         let contents = file::read_to_string(path)?;
         if path.file_name() == Some(".sdkmanrc".as_ref()) {
             let version = contents
@@ -401,7 +402,7 @@ impl Backend for JavaPlugin {
                 .unwrap_or_default()
                 .1;
             if !version.contains('-') {
-                return Ok(version.to_string());
+                return Ok(vec![version.to_string()]);
             }
             let (version, vendor) = version.rsplit_once('-').unwrap_or_default();
             let vendor = match vendor {
@@ -421,9 +422,12 @@ impl Backend for JavaPlugin {
             if vendor == "zulu" {
                 version = version.split_once('.').unwrap_or_default().0;
             }
-            Ok(format!("{vendor}-{version}"))
+            Ok(vec![format!("{vendor}-{version}")])
         } else {
-            Ok(contents)
+            Ok(normalize_idiomatic_contents(&contents)
+                .lines()
+                .map(|s| s.to_string())
+                .collect())
         }
     }
 

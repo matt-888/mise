@@ -21,6 +21,7 @@ use std::sync::LazyLock;
 
 use super::platform_target::PlatformTarget;
 use super::static_helpers::get_filename_from_url;
+use crate::file::TarFormat;
 use crate::http::HTTP;
 
 // ========== Platform Detection Types (from asset_detector) ==========
@@ -164,11 +165,6 @@ static LIBC_PATTERNS: LazyLock<Vec<(AssetLibc, Regex)>> = LazyLock::new(|| {
     ]
 });
 
-static ARCHIVE_EXTENSIONS: &[&str] = &[
-    ".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tgz", ".tbz2", ".txz", ".tzst", ".zip", ".7z",
-    ".tar",
-];
-
 // ========== AssetPicker (from asset_detector) ==========
 
 /// Automatically detects the best asset for the current platform
@@ -180,13 +176,15 @@ pub struct AssetPicker {
 }
 
 impl AssetPicker {
-    /// Create an AssetPicker with an explicit libc setting
+    /// Create an AssetPicker with an explicit libc setting.
+    /// When no explicit libc is provided, defaults to the platform's standard libc
+    /// (msvc for Windows, gnu for Linux/other). The caller is responsible for passing
+    /// the correct libc qualifier from PlatformTarget — this avoids polluting
+    /// cross-platform lockfile entries with the current system's libc.
     pub fn with_libc(target_os: String, target_arch: String, libc: Option<String>) -> Self {
         let target_libc = libc.unwrap_or_else(|| {
             if target_os == "windows" {
                 "msvc".to_string()
-            } else if cfg!(target_env = "musl") {
-                "musl".to_string()
             } else {
                 "gnu".to_string()
             }
@@ -319,19 +317,17 @@ impl AssetPicker {
     }
 
     fn score_format_preferences(&self, asset: &str) -> i32 {
-        let asset = asset.to_lowercase();
-        if asset.ends_with(".zip") {
+        let format = TarFormat::from_file_name(asset);
+
+        if format == TarFormat::Zip {
             if self.target_os == "windows" {
                 return 15;
             } else {
                 return 5;
             }
         }
-        if ARCHIVE_EXTENSIONS.iter().any(|ext| asset.ends_with(ext)) {
-            10
-        } else {
-            0
-        }
+
+        if format.is_archive() { 10 } else { 0 }
     }
 
     fn score_build_penalties(&self, asset: &str) -> i32 {

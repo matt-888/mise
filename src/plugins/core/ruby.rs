@@ -9,7 +9,7 @@ use itertools::Itertools;
 use xx::regex;
 
 use crate::backend::platform_target::PlatformTarget;
-use crate::backend::{Backend, VersionInfo};
+use crate::backend::{Backend, VersionInfo, normalize_idiomatic_contents};
 use crate::cli::args::BackendArg;
 use crate::cmd::CmdLineRunner;
 use crate::config::{Config, Settings};
@@ -485,7 +485,13 @@ impl RubyPlugin {
         platform: &str,
         prefer_no_yjit: bool,
     ) -> Result<Option<(String, Option<String>)>> {
-        let releases = github::list_releases(repo).await?;
+        let release = match github::get_release(repo, version).await {
+            Ok(r) => r,
+            Err(err) => {
+                debug!("no precompiled ruby found for {version}: {err}");
+                return Ok(None);
+            }
+        };
         let standard_name = format!("ruby-{}.{}.tar.gz", version, platform);
         let no_yjit_name = format!("ruby-{}.{}.no_yjit.tar.gz", version, platform);
 
@@ -496,18 +502,11 @@ impl RubyPlugin {
         let mut standard_asset = None;
         let mut no_yjit_asset = None;
 
-        for release in &releases {
-            for asset in &release.assets {
-                if no_yjit_asset.is_none() && asset.name == no_yjit_name {
-                    no_yjit_asset =
-                        Some((asset.browser_download_url.clone(), asset.digest.clone()));
-                } else if standard_asset.is_none() && asset.name == standard_name {
-                    standard_asset =
-                        Some((asset.browser_download_url.clone(), asset.digest.clone()));
-                }
-            }
-            if no_yjit_asset.is_some() && standard_asset.is_some() {
-                break;
+        for asset in &release.assets {
+            if no_yjit_asset.is_none() && asset.name == no_yjit_name {
+                no_yjit_asset = Some((asset.browser_download_url.clone(), asset.digest.clone()));
+            } else if standard_asset.is_none() && asset.name == standard_name {
+                standard_asset = Some((asset.browser_download_url.clone(), asset.digest.clone()));
             }
         }
 
@@ -614,8 +613,8 @@ impl RubyPlugin {
             hash::ensure_checksum(&tarball_path, hash_str, Some(ctx.pr.as_ref()), "sha256")?;
         }
 
-        // Verify GitHub attestations for precompiled binaries
-        self.verify_github_attestations(ctx, &tarball_path, &tv.version)
+        // Verify GitHub artifact attestations for precompiled binaries
+        self.verify_github_artifact_attestations(ctx, &tarball_path, &tv.version)
             .await?;
 
         ctx.pr.set_message(format!("extract {}", filename));
@@ -625,10 +624,9 @@ impl RubyPlugin {
             &tarball_path,
             &install_path,
             &file::TarOptions {
-                format: file::TarFormat::TarGz,
                 strip_components: 1,
                 pr: Some(ctx.pr.as_ref()),
-                ..Default::default()
+                ..file::TarOptions::new(file::TarFormat::TarGz)
             },
         )?;
 
@@ -638,7 +636,7 @@ impl RubyPlugin {
     /// Verify GitHub artifact attestations for precompiled Ruby binary
     /// Returns Ok(()) if verification succeeds or is skipped (attestations unavailable)
     /// Returns Err if verification is enabled and fails
-    async fn verify_github_attestations(
+    async fn verify_github_artifact_attestations(
         &self,
         ctx: &InstallContext,
         tarball_path: &std::path::Path,
@@ -652,7 +650,7 @@ impl RubyPlugin {
             .github_attestations
             .unwrap_or(settings.github_attestations);
         if !enabled {
-            debug!("GitHub attestations verification disabled for Ruby");
+            debug!("GitHub artifact attestations verification disabled for Ruby");
             return Ok(());
         }
 
@@ -660,7 +658,7 @@ impl RubyPlugin {
 
         // Skip for custom URL templates (not GitHub repos)
         if source.contains("://") {
-            debug!("Skipping attestation verification for custom URL template");
+            debug!("Skipping GitHub artifact attestation verification for custom URL template");
             return Ok(());
         }
 
@@ -672,7 +670,8 @@ impl RubyPlugin {
             }
         };
 
-        ctx.pr.set_message("verify GitHub attestations".to_string());
+        ctx.pr
+            .set_message("verify GitHub artifact attestations".to_string());
 
         match sigstore_verification::verify_github_attestation(
             tarball_path,
@@ -685,21 +684,21 @@ impl RubyPlugin {
         {
             Ok(true) => {
                 ctx.pr
-                    .set_message("✓ GitHub attestations verified".to_string());
+                    .set_message("✓ GitHub artifact attestations verified".to_string());
                 debug!(
-                    "GitHub attestations verified successfully for ruby@{}",
+                    "GitHub artifact attestations verified successfully for ruby@{}",
                     version
                 );
                 Ok(())
             }
             Ok(false) => Err(eyre!(
-                "GitHub attestations verification failed for ruby@{version}\n{ATTESTATION_HELP}"
+                "GitHub artifact attestations verification failed for ruby@{version}\n{ATTESTATION_HELP}"
             )),
             Err(sigstore_verification::AttestationError::NoAttestations) => Err(eyre!(
-                "No GitHub attestations found for ruby@{version}\n{ATTESTATION_HELP}"
+                "No GitHub artifact attestations found for ruby@{version}\n{ATTESTATION_HELP}"
             )),
             Err(e) => Err(eyre!(
-                "GitHub attestations verification failed for ruby@{version}: {e}\n{ATTESTATION_HELP}"
+                "GitHub artifact attestations verification failed for ruby@{version}: {e}\n{ATTESTATION_HELP}"
             )),
         }
     }
@@ -719,7 +718,7 @@ impl Backend for RubyPlugin {
             algorithm: Some("sha256".to_string()),
         }];
 
-        // Report GitHub attestations if enabled for precompiled binaries
+        // Report GitHub artifact attestations if enabled for precompiled binaries
         let github_attestations_enabled = settings
             .ruby
             .github_attestations
@@ -774,23 +773,26 @@ impl Backend for RubyPlugin {
         .await
     }
 
-    async fn idiomatic_filenames(&self) -> Result<Vec<String>> {
+    async fn _idiomatic_filenames(&self) -> Result<Vec<String>> {
         Ok(vec![".ruby-version".into(), "Gemfile".into()])
     }
 
-    async fn parse_idiomatic_file(&self, path: &Path) -> Result<String> {
+    async fn _parse_idiomatic_file(&self, path: &Path) -> Result<Vec<String>> {
         let v = match path.file_name() {
             Some(name) if name == "Gemfile" => parse_gemfile(&file::read_to_string(path)?),
             _ => {
                 // .ruby-version
-                let body = file::read_to_string(path)?;
+                let body = normalize_idiomatic_contents(&file::read_to_string(path)?);
                 body.trim()
                     .trim_start_matches("ruby-")
                     .trim_start_matches('v')
                     .to_string()
             }
         };
-        Ok(v)
+        if v.is_empty() {
+            return Ok(vec![]);
+        }
+        Ok(vec![v])
     }
 
     async fn install_version_(&self, ctx: &InstallContext, tv: ToolVersion) -> Result<ToolVersion> {
@@ -882,6 +884,11 @@ impl Backend for RubyPlugin {
         tv: &ToolVersion,
         target: &PlatformTarget,
     ) -> Result<PlatformInfo> {
+        // Windows uses RubyInstaller2 binaries, not source tarballs
+        if target.os_name() == "windows" {
+            return super::ruby_common::resolve_rubyinstaller_lock_info(&tv.version).await;
+        }
+
         // Precompiled binary info if enabled
         if self.should_try_precompiled()
             && let Some(platform) = self.precompiled_platform_for_target(target)

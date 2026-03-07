@@ -116,13 +116,16 @@ impl Backend for RustPlugin {
         Ok(versions)
     }
 
-    async fn idiomatic_filenames(&self) -> Result<Vec<String>> {
+    async fn _idiomatic_filenames(&self) -> Result<Vec<String>> {
         Ok(vec!["rust-toolchain.toml".into()])
     }
 
-    async fn parse_idiomatic_file(&self, path: &Path) -> Result<String> {
+    async fn _parse_idiomatic_file(&self, path: &Path) -> Result<Vec<String>> {
         let rt = parse_idiomatic_file(path)?;
-        Ok(rt.channel)
+        if rt.channel.is_empty() {
+            return Ok(vec![]);
+        }
+        Ok(vec![rt.channel])
     }
 
     async fn install_version_(&self, ctx: &InstallContext, tv: ToolVersion) -> Result<ToolVersion> {
@@ -262,7 +265,7 @@ fn get_args(tv: &ToolVersion) -> (Option<String>, Option<Vec<String>>, Option<Ve
     let profile = rt
         .as_ref()
         .and_then(|rt| rt.profile.clone())
-        .or_else(|| tv.request.options().get("profile").cloned());
+        .or_else(|| tv.request.options().get("profile").map(|s| s.to_string()));
     let components = rt
         .as_ref()
         .and_then(|rt| rt.components.clone())

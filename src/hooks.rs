@@ -1,6 +1,7 @@
 use crate::cmd::cmd;
 use crate::config::{Config, Settings, config_file};
 use crate::shell::Shell;
+use crate::tera::get_tera;
 use crate::toolset::{ToolVersion, Toolset};
 use crate::{dirs, hook_env};
 use eyre::Result;
@@ -51,7 +52,7 @@ pub enum Hooks {
 }
 
 /// Represents a hook definition in TOML config.
-/// Supports string, table, or array formats via serde untagged deserialization.
+/// Supports string, table, task reference, or array formats via serde untagged deserialization.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(untagged)]
 pub enum HookDef {
@@ -62,7 +63,9 @@ pub enum HookDef {
         script: String,
         shell: Option<String>,
     },
-    /// Array of hook definitions: `enter = ["echo hello", { script = "echo world" }]`
+    /// Task reference: `enter = { task = "setup" }`
+    TaskRef { task: String },
+    /// Array of hook definitions: `enter = ["echo hello", { task = "setup" }]`
     Array(Vec<HookDef>),
 }
 
@@ -74,12 +77,21 @@ impl HookDef {
                 hook: hook_type,
                 script,
                 shell: None,
+                task_name: None,
                 global: false,
             }],
             HookDef::Table { script, shell } => vec![Hook {
                 hook: hook_type,
                 script,
                 shell,
+                task_name: None,
+                global: false,
+            }],
+            HookDef::TaskRef { task } => vec![Hook {
+                hook: hook_type,
+                script: String::new(),
+                shell: None,
+                task_name: Some(task),
                 global: false,
             }],
             HookDef::Array(arr) => arr
@@ -95,6 +107,8 @@ pub struct Hook {
     pub hook: Hooks,
     pub script: String,
     pub shell: Option<String>,
+    /// Task name to run instead of a script
+    pub task_name: Option<String>,
     /// Whether this hook comes from a global config (skip directory matching)
     pub global: bool,
 }
@@ -208,7 +222,11 @@ pub async fn run_one_hook_with_context(
                 _ => {}
             }
         }
-        if h.shell.is_some() {
+        if h.task_name.is_some() {
+            if let Err(e) = execute_task(config, ts, root, h, installed_tools).await {
+                warn!("{hook} hook in {} failed: {e}", root.display());
+            }
+        } else if h.shell.is_some() {
             if let Some(shell) = shell {
                 // Set hook environment variables so shell hooks can access them
                 println!(
@@ -255,19 +273,27 @@ async fn execute(
     Settings::get().ensure_experimental("hooks")?;
     let shell = Settings::get().default_inline_shell()?;
 
+    // Preinstall hooks skip `tools=true` env directives since the tools
+    // providing those env vars aren't installed yet (fixes #6162)
+    let (tera_ctx, mut env) = if hook.hook == Hooks::Preinstall {
+        let env = ts.full_env_without_tools(config).await?;
+        let mut ctx = config.tera_ctx.clone();
+        ctx.insert("env", &env);
+        (ctx, env)
+    } else {
+        let ctx = ts.tera_ctx(config).await?.clone();
+        let env = ts.full_env(config).await?;
+        (ctx, env)
+    };
+    let mut tera = get_tera(Some(root));
+    let rendered_script = tera.render_str(&hook.script, &tera_ctx)?;
+
     let args = shell
         .iter()
         .skip(1)
         .map(|s| s.as_str())
-        .chain(once(hook.script.as_str()))
+        .chain(once(rendered_script.as_str()))
         .collect_vec();
-    // Preinstall hooks skip `tools=true` env directives since the tools
-    // providing those env vars aren't installed yet (fixes #6162)
-    let mut env = if hook.hook == Hooks::Preinstall {
-        ts.full_env_without_tools(config).await?
-    } else {
-        ts.full_env(config).await?
-    };
     if let Some(cwd) = dirs::CWD.as_ref() {
         env.insert(
             "MISE_ORIGINAL_CWD".to_string(),
@@ -302,5 +328,62 @@ async fn execute(
         // .dir(root)
         .full_env(env)
         .run()?;
+    Ok(())
+}
+
+async fn execute_task(
+    config: &Arc<Config>,
+    ts: &Toolset,
+    root: &Path,
+    hook: &Hook,
+    installed_tools: Option<&[InstalledToolInfo]>,
+) -> Result<()> {
+    Settings::get().ensure_experimental("hooks")?;
+    let task_name = hook
+        .task_name
+        .as_ref()
+        .ok_or_else(|| eyre::eyre!("hook has no task name"))?;
+
+    let mise_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("mise"));
+
+    let mut env = if hook.hook == Hooks::Preinstall {
+        ts.full_env_without_tools(config).await?
+    } else {
+        ts.full_env(config).await?
+    };
+    if let Some(cwd) = dirs::CWD.as_ref() {
+        env.insert(
+            "MISE_ORIGINAL_CWD".to_string(),
+            cwd.to_string_lossy().to_string(),
+        );
+    }
+    env.insert(
+        "MISE_PROJECT_ROOT".to_string(),
+        root.to_string_lossy().to_string(),
+    );
+    env.insert(
+        "MISE_CONFIG_ROOT".to_string(),
+        root.to_string_lossy().to_string(),
+    );
+    if let Some((Some(old), _new)) = hook_env::dir_change() {
+        env.insert(
+            "MISE_PREVIOUS_DIR".to_string(),
+            old.to_string_lossy().to_string(),
+        );
+    }
+    if let Some(tools) = installed_tools
+        && let Ok(json) = serde_json::to_string(tools)
+    {
+        env.insert("MISE_INSTALLED_TOOLS".to_string(), json);
+    }
+    env.insert("MISE_NO_HOOKS".to_string(), "1".to_string());
+
+    cmd(
+        mise_bin,
+        ["--cd", &root.to_string_lossy(), "run", task_name.as_str()],
+    )
+    .stdout_to_stderr()
+    .full_env(env)
+    .run()?;
     Ok(())
 }

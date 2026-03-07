@@ -291,6 +291,74 @@ pub fn install_time_option_keys_for_type(backend_type: &BackendType) -> Vec<Stri
     }
 }
 
+/// Normalize idiomatic file contents by removing comments and empty lines.
+/// Full-line and inline comments are supported by .python-version, .nvmrc, etc.
+pub(crate) fn normalize_idiomatic_contents(contents: &str) -> String {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+
+            // Skip empty lines or lines that are entirely comments
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                return None;
+            }
+
+            // Find an inline comment marked by a `#` preceded by whitespace, preserving valid `#` chars in versions like `tool#tag`
+            let comment_idx = trimmed.char_indices().find_map(|(i, c)| {
+                if c == '#' && trimmed[..i].ends_with(char::is_whitespace) {
+                    Some(i)
+                } else {
+                    None
+                }
+            });
+
+            // Strip the inline comment if found, otherwise retain the whole trimmed string
+            let without_inline = if let Some(idx) = comment_idx {
+                trimmed[..idx].trim()
+            } else {
+                trimmed
+            };
+
+            // Double check the line hasn't become empty after stripping the comment
+            if without_inline.is_empty() {
+                None
+            } else {
+                Some(without_inline)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_idiomatic_contents() {
+        assert_eq!(normalize_idiomatic_contents("tool # and a comment"), "tool");
+        assert_eq!(normalize_idiomatic_contents("tool#tag"), "tool#tag");
+        assert_eq!(
+            normalize_idiomatic_contents("tool#tag # comment"),
+            "tool#tag"
+        );
+        assert_eq!(normalize_idiomatic_contents("   # full line comment"), "");
+        assert_eq!(
+            normalize_idiomatic_contents("3.12.3\n3.11.11"),
+            "3.12.3\n3.11.11"
+        );
+        assert_eq!(
+            normalize_idiomatic_contents("3.12.3 # inline\n# comment\n3.11.11"),
+            "3.12.3\n3.11.11"
+        );
+        assert_eq!(
+            normalize_idiomatic_contents("# full line comment\n3.14.2 # inline comment\n   \n\n"),
+            "3.14.2"
+        );
+    }
+}
+
 #[async_trait]
 pub trait Backend: Debug + Send + Sync {
     fn id(&self) -> &str {
@@ -305,12 +373,10 @@ pub trait Backend: Debug + Send + Sync {
     fn ba(&self) -> &Arc<BackendArg>;
 
     /// Generates a platform key for lockfile storage.
-    /// Default implementation uses os-arch format, but backends can override for more specific keys.
+    /// Default implementation uses the current platform key (os-arch or os-arch-qualifier),
+    /// which includes the libc qualifier on musl systems.
     fn get_platform_key(&self) -> String {
-        let settings = Settings::get();
-        let os = settings.os();
-        let arch = settings.arch();
-        format!("{os}-{arch}")
+        Platform::current().to_key()
     }
 
     /// Resolves the lockfile options for a tool request on a target platform.
@@ -847,22 +913,57 @@ pub trait Backend: Debug + Send + Sync {
     fn get_aliases(&self) -> eyre::Result<BTreeMap<String, String>> {
         Ok(BTreeMap::new())
     }
+
+    /// Returns a list of idiomatic filenames for this tool.
+    ///
+    /// This method is additive:
+    /// 1. It calls `_idiomatic_filenames` to get backend-specific filenames.
+    /// 2. It checks the Registry for any additional filenames defined there.
     async fn idiomatic_filenames(&self) -> Result<Vec<String>> {
-        Ok(REGISTRY
-            .get(self.id())
-            .map(|rt| rt.idiomatic_files.iter().map(|s| s.to_string()).collect())
-            .unwrap_or_default())
-    }
-    async fn parse_idiomatic_file(&self, path: &Path) -> eyre::Result<String> {
-        if path.file_name().is_some_and(|f| f == "package.json") {
-            let pkg = crate::package_json::PackageJson::parse(path)?;
-            return pkg
-                .package_manager_version(self.id())
-                .ok_or_else(|| eyre::eyre!("no {} version found in package.json", self.id()));
+        let mut filenames = self._idiomatic_filenames().await?;
+        if let Some(rt) = REGISTRY.get(self.id()) {
+            filenames.extend(rt.idiomatic_files.iter().map(|s| s.to_string()));
         }
-        let contents = file::read_to_string(path)?;
-        Ok(contents.trim().to_string())
+        filenames = filenames.into_iter().unique().collect();
+        Ok(filenames)
     }
+
+    /// Backend-specific implementation for `idiomatic_filenames`.
+    /// Override this to provide native idiomatic filenames for the backend.
+    async fn _idiomatic_filenames(&self) -> Result<Vec<String>> {
+        Ok(vec![])
+    }
+
+    /// Parses an idiomatic version file to extract the version.
+    ///
+    /// This handles special files like `package.json` which are parsed natively to avoid
+    /// every backend needing to implement `package.json` support. For other files, it
+    /// delegates to `_parse_idiomatic_file`.
+    async fn parse_idiomatic_file(&self, path: &Path) -> eyre::Result<Vec<String>> {
+        if path.file_name().is_some_and(|f| f == "package.json") {
+            return crate::config::config_file::idiomatic_version::package_json::parse(
+                path,
+                self.id(),
+            );
+        }
+        self._parse_idiomatic_file(path).await
+    }
+
+    /// Backend-specific implementation for `parse_idiomatic_file`.
+    /// Default implementation reads the file and treats each whitespace-separated token as a version.
+    /// Override to provide format-specific parsing; return `Err` on real failures so the plugin is skipped.
+    async fn _parse_idiomatic_file(&self, path: &Path) -> eyre::Result<Vec<String>> {
+        let contents = file::read_to_string(path)?;
+        let normalized = normalize_idiomatic_contents(&contents);
+        if normalized.is_empty() {
+            return Ok(vec![]);
+        }
+        Ok(normalized
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect())
+    }
+
     fn plugin(&self) -> Option<&PluginEnum> {
         None
     }
@@ -876,6 +977,13 @@ pub trait Backend: Debug + Send + Sync {
         // Exempt tool stubs from lockfile requirements since they are ephemeral
         // Also exempt backends that don't support URL locking (e.g., Rust uses rustup)
         // This must run before the dry-run check so that --locked --dry-run still validates
+        let settings = Settings::get();
+        if (ctx.locked || settings.locked) && settings.lockfile == Some(false) {
+            bail!(
+                "locked mode requires lockfile to be enabled\n\
+                hint: Remove `lockfile = false` or set `lockfile = true`, or disable locked mode"
+            );
+        }
         if ctx.locked && !tv.request.source().is_tool_stub() && self.supports_lockfile_url() {
             let platform_key = self.get_platform_key();
             let has_lockfile_url = tv
@@ -1335,7 +1443,7 @@ pub trait Backend: Debug + Send + Sync {
     ) -> Result<()> {
         let settings = Settings::get();
         let filename = file.file_name().unwrap().to_string_lossy().to_string();
-        let lockfile_enabled = settings.lockfile;
+        let lockfile_enabled = settings.lockfile_enabled();
 
         // Get the platform key for this tool and platform
         let platform_key = self.get_platform_key();
@@ -1517,7 +1625,7 @@ pub fn http_install_operation_count(
     if has_checksum_opt {
         count += 1;
     }
-    let lockfile_enabled = settings.lockfile;
+    let lockfile_enabled = settings.lockfile_enabled();
     let has_lockfile_checksum = tv
         .lock_platforms
         .get(platform_key)

@@ -4,13 +4,17 @@ use serde::{Deserialize, Serialize};
 
 /// List of built-in provider names that have specialized implementations
 pub const BUILTIN_PROVIDERS: &[&str] = &[
-    "npm", "yarn", "pnpm", "bun",      // Node.js
-    "go",       // Go
-    "pip",      // Python (requirements.txt)
-    "poetry",   // Python (poetry)
-    "uv",       // Python (uv)
-    "bundler",  // Ruby
-    "composer", // PHP
+    "npm",
+    "yarn",
+    "pnpm",
+    "bun",           // Node.js
+    "go",            // Go
+    "pip",           // Python (requirements.txt)
+    "poetry",        // Python (poetry)
+    "uv",            // Python (uv)
+    "bundler",       // Ruby
+    "composer",      // PHP
+    "git-submodule", // Git
 ];
 
 /// Configuration for a prepare provider (both built-in and custom)
@@ -42,6 +46,11 @@ pub struct PrepareProviderConfig {
     /// This is useful when the prepare command is a no-op (e.g., `uv sync` when all is well)
     /// so that the outputs appear fresh for subsequent freshness checks.
     pub touch_outputs: Option<bool>,
+    /// Other prepare providers that must complete before this one runs
+    #[serde(default)]
+    pub depends: Vec<String>,
+    /// Timeout for the run command (e.g., "30s", "5m", "1h")
+    pub timeout: Option<String>,
 }
 
 impl PrepareProviderConfig {

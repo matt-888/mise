@@ -12,8 +12,46 @@ pub use engine::{PrepareEngine, PrepareOptions, PrepareStepResult};
 pub use rule::PrepareConfig;
 
 mod engine;
+pub(crate) mod prepare_deps;
 pub mod providers;
 mod rule;
+pub mod state;
+
+/// Result of a freshness check for a prepare provider
+#[derive(Debug, Clone)]
+pub enum FreshnessResult {
+    /// Outputs are up to date with sources
+    Fresh,
+    /// Provider has no outputs defined, always run to be safe
+    NoOutputs,
+    /// One or more output paths don't exist
+    OutputsMissing,
+    /// Sources have changed since last successful run
+    Stale(String),
+    /// Provider has no sources, consider fresh
+    NoSources,
+    /// Force flag was used
+    Forced,
+}
+
+impl FreshnessResult {
+    /// Returns true if the provider should be considered fresh (no work needed)
+    pub fn is_fresh(&self) -> bool {
+        matches!(self, FreshnessResult::Fresh | FreshnessResult::NoSources)
+    }
+
+    /// Human-readable reason string for display
+    pub fn reason(&self) -> &str {
+        match self {
+            FreshnessResult::Fresh => "outputs are up to date",
+            FreshnessResult::NoOutputs => "no outputs defined",
+            FreshnessResult::OutputsMissing => "outputs missing",
+            FreshnessResult::Stale(reason) => reason,
+            FreshnessResult::NoSources => "no sources to check",
+            FreshnessResult::Forced => "forced",
+        }
+    }
+}
 
 /// A command to execute for preparation
 #[derive(Debug, Clone)]
@@ -95,6 +133,24 @@ pub trait PrepareProvider: Debug + Send + Sync {
     fn touch_outputs(&self) -> bool {
         self.base().touch_outputs()
     }
+
+    /// Other prepare providers that must complete before this one runs
+    fn depends(&self) -> Vec<String> {
+        self.base().config.depends.clone()
+    }
+
+    /// Timeout duration for this provider's run command
+    fn timeout(&self) -> Option<std::time::Duration> {
+        self.base().config.timeout.as_deref().and_then(|t| {
+            match crate::duration::parse_duration(t) {
+                Ok(d) => Some(d),
+                Err(err) => {
+                    warn!("prepare: {}: invalid timeout {t:?}: {err}", self.id());
+                    None
+                }
+            }
+        })
+    }
 }
 
 /// Warn if any auto-enabled prepare providers are stale
@@ -115,8 +171,12 @@ pub fn notify_if_stale(config: &Arc<Config>) {
 
     let stale = engine.check_staleness();
     if !stale.is_empty() {
-        let providers = stale.join(", ");
-        warn!("prepare: {providers} may need update, run `mise prep`");
+        let providers: Vec<String> = stale
+            .iter()
+            .map(|(id, reason)| format!("{id} ({reason})"))
+            .collect();
+        let summary = providers.join(", ");
+        warn!("prepare: {summary} — run `mise prep`");
     }
 }
 
@@ -219,6 +279,13 @@ pub fn detect_applicable_providers(project_root: &Path) -> Vec<String> {
         (
             "composer",
             Box::new(ComposerPrepareProvider::new(
+                project_root,
+                default_config.clone(),
+            )),
+        ),
+        (
+            "git-submodule",
+            Box::new(GitSubmodulePrepareProvider::new(
                 project_root,
                 default_config.clone(),
             )),

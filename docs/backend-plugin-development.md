@@ -55,9 +55,11 @@ function PLUGIN:BackendInstall(ctx)
     local version = ctx.version
     local install_path = ctx.install_path
     local download_path = ctx.download_path
+    local options = ctx.options
 
     -- Your logic to install the tool
     -- Example: download files, extract archives, etc.
+    -- Access custom options via options["key"] or options.key
 
     return {}
 end
@@ -70,9 +72,11 @@ Sets up environment variables for a tool:
 ```lua
 function PLUGIN:BackendExecEnv(ctx)
     local install_path = ctx.install_path
+    local options = ctx.options
 
     -- Your logic to set up environment variables
     -- Example: add bin directories to PATH
+    -- Access custom options via options["key"] or options.key
 
     return {
         env_vars = {

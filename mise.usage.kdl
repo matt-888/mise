@@ -569,10 +569,13 @@ cmd mcp help="[experimental] Run Model Context Protocol (MCP) server" {
 }
 cmd outdated help="Shows outdated tool versions" {
     long_help "Shows outdated tool versions\n\nSee `mise upgrade` to upgrade these versions."
-    after_long_help "Examples:\n\n    $ mise outdated\n    Plugin  Requested  Current  Latest\n    python  3.11       3.11.0   3.11.1\n    node    20         20.0.0   20.1.0\n\n    $ mise outdated node\n    Plugin  Requested  Current  Latest\n    node    20         20.0.0   20.1.0\n\n    $ mise outdated --json\n    {\"python\": {\"requested\": \"3.11\", \"current\": \"3.11.0\", \"latest\": \"3.11.1\"}, ...}\n"
+    after_long_help "Examples:\n\n    $ mise outdated\n    Plugin  Requested  Current  Latest\n    python  3.11       3.11.0   3.11.1\n    node    20         20.0.0   20.1.0\n\n    $ mise outdated node\n    Plugin  Requested  Current  Latest\n    node    20         20.0.0   20.1.0\n\n    $ mise outdated --json\n    {\"python\": {\"requested\": \"3.11\", \"current\": \"3.11.0\", \"latest\": \"3.11.1\"}, ...}\n\n    $ mise outdated --local\n    Plugin  Requested  Current  Latest\n    node    20         20.0.0   20.1.0\n"
     flag "-J --json" help="Output in JSON format"
     flag "-l --bump" help="Compares against the latest versions available, not what matches the current config" {
         long_help "Compares against the latest versions available, not what matches the current config\n\nFor example, if you have `node = \"20\"` in your config by default `mise outdated` will only\nshow other 20.x versions, not 21.x or 22.x versions.\n\nUsing this flag, if there are 21.x or newer versions it will display those instead of 20.x."
+    }
+    flag --local help="Only show outdated tools defined in local config files" {
+        long_help "Only show outdated tools defined in local config files\n\nThis will only show tools that are defined in project-local mise.toml and\nwill skip tools defined in the global config (~/.config/mise/config.toml)."
     }
     flag --no-header help="Don't show table header"
     arg "[TOOL@VERSION]…" help="Tool(s) to show outdated versions for\ne.g.: node@20 python@3.10\nIf not specified, all tools in global and local configs will be shown" required=#false var=#true
@@ -617,6 +620,7 @@ cmd plugins help="Manage plugins" {
         after_long_help "Examples:\n\n    $ mise plugins ls\n    cmake\n    poetry\n\n    $ mise plugins ls --urls\n    cmake     https://github.com/mise-plugins/vfox-cmake.git\n    poetry    https://github.com/mise-plugins/vfox-poetry.git\n"
         flag "-a --all" help="List all available remote plugins\nSame as `mise plugins ls-remote`" hide=#true
         flag "-c --core" help="The built-in plugins only\nNormally these are not shown" hide=#true
+        flag "-o --outdated" help="Show plugins with available updates\nChecks the remote for newer versions and only displays plugins that are outdated"
         flag "-u --urls" help="Show the git url for each plugin\ne.g.: https://github.com/mise-plugins/vfox-cmake.git"
         flag --refs help="Show the git refs for each plugin\ne.g.: main 1234abc" hide=#true
         flag --user help="List installed plugins" hide=#true
@@ -647,16 +651,18 @@ cmd plugins help="Manage plugins" {
 cmd prepare help="[experimental] Ensure project dependencies are ready" {
     alias prep
     long_help "[experimental] Ensure project dependencies are ready\n\nRuns all applicable prepare steps for the current project.\nThis checks if dependency lockfiles are newer than installed outputs\n(e.g., package-lock.json vs node_modules/) and runs install commands\nif needed.\n\nProviders with `auto = true` are automatically invoked before `mise x` and `mise run`\nunless skipped with the --no-prepare flag."
-    after_long_help "Examples:\n\n    $ mise prepare              # Run all applicable prepare steps\n    $ mise prepare --dry-run    # Show what would run without executing\n    $ mise prepare --force      # Force run even if outputs are fresh\n    $ mise prepare --list       # List available prepare providers\n    $ mise prepare --only npm   # Run only npm prepare\n    $ mise prepare --skip npm   # Skip npm prepare\n\nConfiguration:\n\n    Configure prepare providers in mise.toml:\n\n    ```toml\n    # Built-in npm provider (auto-detects lockfile)\n    [prepare.npm]\n    auto = true              # Auto-run before mise x/run\n\n    # Custom provider\n    [prepare.codegen]\n    auto = true\n    sources = [\"schema/*.graphql\"]\n    outputs = [\"src/generated/\"]\n    run = \"npm run codegen\"\n\n    [prepare]\n    disable = [\"npm\"]        # Disable specific providers at runtime\n    ```\n"
+    after_long_help "Examples:\n\n    $ mise prepare              # Run all applicable prepare steps\n    $ mise prepare npm          # Run only npm prepare\n    $ mise prepare npm --explain # Show why npm is fresh or stale\n    $ mise prepare --dry-run    # Show what would run without executing\n    $ mise prepare --force      # Force run even if outputs are fresh\n    $ mise prepare --list       # List available prepare providers\n    $ mise prepare --skip npm   # Skip npm prepare\n\nConfiguration:\n\n    Configure prepare providers in mise.toml:\n\n    ```toml\n    # Built-in npm provider (auto-detects lockfile)\n    [prepare.npm]\n    auto = true              # Auto-run before mise x/run\n\n    # Custom provider\n    [prepare.codegen]\n    auto = true\n    sources = [\"schema/*.graphql\"]\n    outputs = [\"src/generated/\"]\n    run = \"npm run codegen\"\n\n    [prepare]\n    disable = [\"npm\"]        # Disable specific providers at runtime\n    ```\n"
+    flag --explain help="Show why a provider is fresh or stale (requires a provider argument)"
     flag "-f --force" help="Force run all prepare steps even if outputs are fresh"
-    flag --list help="Show what prepare steps are available"
     flag "-n --dry-run" help="Only check if prepare is needed, don't run commands"
+    flag --list help="Show what prepare steps are available"
     flag --only help="Run specific prepare rule(s) only" var=#true {
         arg <ONLY>
     }
     flag --skip help="Skip specific prepare rule(s)" var=#true {
         arg <SKIP>
     }
+    arg "[PROVIDER]" help="Provider to operate on (runs only this provider, or use with --explain)" required=#false
 }
 cmd prune help="Delete unused versions of tools" {
     long_help "Delete unused versions of tools\n\nmise tracks which config files have been used in ~/.local/state/mise/tracked-configs\nVersions which are no longer the latest specified in any of those configs are deleted.\nVersions installed only with environment variables `MISE_<PLUGIN>_VERSION` will be deleted,\nas will versions only referenced on the command line `mise exec <PLUGIN>@<VERSION>`.\n\nYou can list prunable tools with `mise ls --prunable`"
@@ -1128,7 +1134,7 @@ cmd unuse help="Removes installed tool versions from mise.toml" {
 cmd upgrade help="Upgrades outdated tools" {
     alias up
     long_help "Upgrades outdated tools\n\nBy default, this keeps the range specified in mise.toml. So if you have node@20 set, it will\nupgrade to the latest 20.x.x version available. See the `--bump` flag to use the latest version\nand bump the version in mise.toml.\n\nThis will update mise.lock if it is enabled, see https://mise.jdx.dev/configuration/settings.html#lockfile"
-    after_long_help "Examples:\n\n    # Upgrades node to the latest version matching the range in mise.toml\n    $ mise upgrade node\n\n    # Upgrades node to the latest version and bumps the version in mise.toml\n    $ mise upgrade node --bump\n\n    # Upgrades all tools to the latest versions\n    $ mise upgrade\n\n    # Upgrades all tools to the latest versions and bumps the version in mise.toml\n    $ mise upgrade --bump\n\n    # Just print what would be done, don't actually do it\n    $ mise upgrade --dry-run\n\n    # Upgrades node and python to the latest versions\n    $ mise upgrade node python\n\n    # Upgrade all tools except go\n    $ mise upgrade --exclude go\n\n    # Show a multiselect menu to choose which tools to upgrade\n    $ mise upgrade --interactive\n"
+    after_long_help "Examples:\n\n    # Upgrades node to the latest version matching the range in mise.toml\n    $ mise upgrade node\n\n    # Upgrades node to the latest version and bumps the version in mise.toml\n    $ mise upgrade node --bump\n\n    # Upgrades all tools to the latest versions\n    $ mise upgrade\n\n    # Upgrades all tools to the latest versions and bumps the version in mise.toml\n    $ mise upgrade --bump\n\n    # Just print what would be done, don't actually do it\n    $ mise upgrade --dry-run\n\n    # Upgrades node and python to the latest versions\n    $ mise upgrade node python\n\n    # Upgrade all tools except go\n    $ mise upgrade --exclude go\n\n    # Show a multiselect menu to choose which tools to upgrade\n    $ mise upgrade --interactive\n\n    # Only upgrade tools defined in local mise.toml, not global ones\n    $ mise upgrade --local\n"
     flag "-i --interactive" help="Display multiselect menu to choose which tools to upgrade"
     flag "-j --jobs" help="Number of jobs to run in parallel\n[default: 4]" {
         arg <JOBS>
@@ -1146,6 +1152,9 @@ cmd upgrade help="Upgrades outdated tools" {
     }
     flag --dry-run-code help="Like --dry-run but exits with code 1 if there are outdated tools" {
         long_help "Like --dry-run but exits with code 1 if there are outdated tools\n\nThis is useful for scripts to check if tools need to be upgraded."
+    }
+    flag --local help="Only upgrade tools defined in local config files" {
+        long_help "Only upgrade tools defined in local config files\n\nThis will only upgrade tools that are defined in project-local mise.toml and\nwill skip tools defined in the global config (~/.config/mise/config.toml)."
     }
     flag --raw help="Directly pipe stdin/stdout/stderr from plugin to user Sets --jobs=1"
     arg "[INSTALLED_TOOL@VERSION]…" help="Tool(s) to upgrade\ne.g.: node@20 python@3.10\nIf not specified, all current tools will be upgraded" required=#false var=#true

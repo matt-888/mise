@@ -153,9 +153,8 @@ impl GoPlugin {
                 tarball_path,
                 tmp_extract_path.path(),
                 &TarOptions {
-                    format: TarFormat::TarGz,
                     pr: Some(pr),
-                    ..Default::default()
+                    ..TarOptions::new(TarFormat::TarGz)
                 },
             )?;
         }
@@ -272,7 +271,7 @@ impl Backend for GoPlugin {
         };
         Ok(versions)
     }
-    async fn idiomatic_filenames(&self) -> eyre::Result<Vec<String>> {
+    async fn _idiomatic_filenames(&self) -> eyre::Result<Vec<String>> {
         Ok(vec![".go-version".into()])
     }
 

@@ -9,6 +9,7 @@ use crate::ui::progress_report::SingleReport;
 use eyre::{Result, bail};
 use indexmap::IndexSet;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::LazyLock;
 
 /// Regex pattern for matching version suffixes like -v1.2.3, _1.2.3, etc.
@@ -247,7 +248,7 @@ pub fn lookup_platform_key(opts: &ToolVersionOptions, key_type: &str) -> Option<
             // Try flat format: platforms_macos_arm64_url
             let flat_key = format!("{prefix}_{os}_{arch}_{key_type}");
             if let Some(val) = opts.get(&flat_key) {
-                return Some(val.clone());
+                return Some(val.to_string());
             }
         }
     }
@@ -265,7 +266,7 @@ pub fn lookup_platform_key(opts: &ToolVersionOptions, key_type: &str) -> Option<
 /// * `Some(value)` if found in platform-specific or base options
 /// * `None` if not found
 pub fn lookup_with_fallback(opts: &ToolVersionOptions, key: &str) -> Option<String> {
-    lookup_platform_key(opts, key).or_else(|| opts.get(key).cloned())
+    lookup_platform_key(opts, key).or_else(|| opts.get(key).map(|s| s.to_string()))
 }
 
 /// Returns all possible aliases for a given platform target (os, arch).
@@ -315,7 +316,7 @@ pub fn lookup_platform_key_for_target(
             // Try flat format: platforms_macos_arm64_url
             let flat_key = format!("{prefix}_{os}_{arch}_{key_type}");
             if let Some(val) = opts.get(&flat_key) {
-                return Some(val.clone());
+                return Some(val.to_string());
             }
         }
     }
@@ -414,7 +415,7 @@ pub fn install_artifact(
 ) -> eyre::Result<()> {
     let install_path = tv.install_path();
     let mut strip_components = lookup_platform_key(opts, "strip_components")
-        .or_else(|| opts.get("strip_components").cloned())
+        .or_else(|| opts.get("strip_components").map(|s| s.to_string()))
         .and_then(|s| s.parse().ok());
 
     file::remove_all(&install_path)?;
@@ -422,27 +423,26 @@ pub fn install_artifact(
 
     // Use TarFormat for format detection
     // Check for explicit format option first, then fall back to file extension
-    let ext = if let Some(format_opt) = lookup_with_fallback(opts, "format") {
-        format_opt
+    let format = if let Some(format_opt) = lookup_with_fallback(opts, "format") {
+        file::TarFormat::from_ext(&format_opt)
     } else {
-        file_path
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string()
+        file::TarFormat::from_file_name(
+            &file_path.file_name().unwrap_or_default().to_string_lossy(),
+        )
     };
-    let format = file::TarFormat::from_ext(&ext);
 
     // Get file extension and detect format
     let file_name = file_path.file_name().unwrap().to_string_lossy();
 
-    // Check if it's a compressed binary (not a tar archive)
-    let is_compressed_binary =
-        !file_name.contains(".tar") && matches!(ext.as_str(), "gz" | "xz" | "bz2" | "zst");
-
-    if is_compressed_binary {
+    if !format.is_archive() && format != file::TarFormat::Raw {
         // Handle compressed single binary
+        let ext = Path::new(&*file_name)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
         let decompressed_name = file_name.trim_end_matches(&format!(".{}", ext));
+
         // Determine the destination path with support for bin_path
         let dest = if let Some(bin_path_template) = lookup_with_fallback(opts, "bin_path") {
             let bin_path = template_string(&bin_path_template, tv);
@@ -457,13 +457,14 @@ pub fn install_artifact(
             install_path.join(cleaned_name)
         };
 
-        match ext.as_str() {
-            "gz" => file::un_gz(file_path, &dest)?,
-            "xz" => file::un_xz(file_path, &dest)?,
-            "bz2" => file::un_bz2(file_path, &dest)?,
-            "zst" => file::un_zst(file_path, &dest)?,
-            _ => unreachable!(),
-        }
+        file::untar(
+            file_path,
+            &dest,
+            &file::TarOptions {
+                pr,
+                ..file::TarOptions::new(format)
+            },
+        )?;
 
         file::make_executable(&dest)?;
     } else if format == file::TarFormat::Raw {
@@ -494,7 +495,7 @@ pub fn install_artifact(
         // Only do this if strip_components was not explicitly set by the user AND bin_path is not configured
         if strip_components.is_none()
             && lookup_platform_key(opts, "bin_path")
-                .or_else(|| opts.get("bin_path").cloned())
+                .or_else(|| opts.get("bin_path").map(|s| s.to_string()))
                 .is_none()
             && let Ok(should_strip) = file::should_strip_components(file_path, format)
             && should_strip
@@ -503,10 +504,9 @@ pub fn install_artifact(
             strip_components = Some(1);
         }
         let tar_opts = file::TarOptions {
-            format,
             strip_components: strip_components.unwrap_or(0),
             pr,
-            ..Default::default()
+            ..file::TarOptions::new(format)
         };
 
         // Extract with determined strip_components
@@ -517,21 +517,31 @@ pub fn install_artifact(
         let full_tool_name = tv.ba().tool_name.as_str();
         let tool_name = full_tool_name.rsplit('/').next().unwrap_or(full_tool_name);
 
-        // Determine search directory based on bin_path option (used by both bin= and rename_exe=)
-        let search_dir = if let Some(bin_path_template) = lookup_with_fallback(opts, "bin_path") {
-            let bin_path = template_string(&bin_path_template, tv);
-            install_path.join(&bin_path)
-        } else {
-            install_path.clone()
-        };
+        // Determine search directory based on bin_path option
+        let explicit_bin_path = lookup_with_fallback(opts, "bin_path")
+            .map(|t| install_path.join(template_string(&t, tv)));
 
         // Handle bin= option for archives (renames executable to specified name)
+        // bin= values are relative to install_path, so always use install_path or explicit bin_path
         if let Some(bin_name) = lookup_with_fallback(opts, "bin") {
-            rename_executable_in_dir(&search_dir, &bin_name, Some(tool_name))?;
+            let search_dir = explicit_bin_path.as_deref().unwrap_or(&install_path);
+            rename_executable_in_dir(search_dir, &bin_name, Some(tool_name))?;
         }
 
         // Handle rename_exe option for archives
+        // When bin_path is not explicitly set, auto-detect bin/ subdirectory to match
+        // the same logic used by discover_bin_paths() for PATH construction
         if let Some(rename_to) = lookup_with_fallback(opts, "rename_exe") {
+            let search_dir = if let Some(ref dir) = explicit_bin_path {
+                dir.clone()
+            } else {
+                let bin_dir = install_path.join("bin");
+                if bin_dir.is_dir() {
+                    bin_dir
+                } else {
+                    install_path.clone()
+                }
+            };
             rename_executable_in_dir(&search_dir, &rename_to, Some(tool_name))?;
         }
     }
@@ -675,8 +685,15 @@ pub fn rename_executable_in_dir(
             if should_skip_file(&file_name, false) {
                 continue;
             }
-            file::rename(&path, &target_path)?;
-            debug!("Renamed {} to {}", path.display(), target_path.display());
+            let target_path_with_extension =
+                keep_required_extensions(dir, &file_name, new_name, target_path);
+
+            file::rename(&path, &target_path_with_extension)?;
+            debug!(
+                "Renamed {} to {}",
+                path.display(),
+                target_path_with_extension.display()
+            );
             return Ok(());
         }
     }
@@ -692,12 +709,15 @@ pub fn rename_executable_in_dir(
 
                 // Check if filename matches tool name pattern or the target name
                 if file_name.contains(tool_name) || *file_name == *new_name {
+                    let target_path_with_extension =
+                        keep_required_extensions(dir, &file_name, new_name, target_path);
+
                     file::make_executable(&path)?;
-                    file::rename(&path, &target_path)?;
+                    file::rename(&path, &target_path_with_extension)?;
                     debug!(
                         "Found and renamed {} to {} (added exec permissions)",
                         path.display(),
-                        target_path.display()
+                        target_path_with_extension.display()
                     );
                     return Ok(());
                 }
@@ -754,6 +774,39 @@ fn rename_executable_in_app_bundle(
     }
 
     Ok(false)
+}
+
+fn keep_required_extensions(
+    dir: &Path,
+    file_name: &str,
+    new_name: &str,
+    target_path: PathBuf,
+) -> PathBuf {
+    if cfg!(windows) {
+        return keep_extensions(
+            dir,
+            file_name,
+            new_name,
+            target_path,
+            &[".exe", ".cmd", ".bat"],
+        );
+    }
+    target_path
+}
+
+fn keep_extensions(
+    dir: &Path,
+    file_name: &str,
+    new_name: &str,
+    target_path: PathBuf,
+    exts: &[&str],
+) -> PathBuf {
+    for ext in exts {
+        if file_name.to_lowercase().ends_with(ext) && !new_name.to_lowercase().ends_with(ext) {
+            return dir.join(format!("{}{}", new_name, ext));
+        }
+    }
+    target_path
 }
 
 /// Cleans a binary name by removing OS/arch suffixes and version numbers.
@@ -1002,21 +1055,103 @@ mod tests {
     }
 
     #[test]
+    fn test_keep_extensions() {
+        let dir = Path::new("/tmp");
+        let initial_target = dir.join("new_tool");
+
+        // Does not append extension not in the list
+        assert_eq!(
+            keep_extensions(
+                dir,
+                "mytool.sh",
+                "new_tool",
+                initial_target.clone(),
+                &[".exe"]
+            ),
+            initial_target
+        );
+
+        // Appends if in the list
+        assert_eq!(
+            keep_extensions(
+                dir,
+                "mytool.sh",
+                "new_tool",
+                initial_target.clone(),
+                &[".sh"]
+            ),
+            dir.join("new_tool.sh")
+        );
+
+        // Case insensitivity handled
+        assert_eq!(
+            keep_extensions(
+                dir,
+                "mytool.SH",
+                "new_tool",
+                initial_target.clone(),
+                &[".sh"]
+            ),
+            dir.join("new_tool.sh")
+        );
+
+        // New name already has extension - avoids double extension
+        assert_eq!(
+            keep_extensions(
+                dir,
+                "mytool.exe",
+                "new_tool.exe",
+                dir.join("new_tool.exe"),
+                &[".exe"]
+            ),
+            dir.join("new_tool.exe")
+        );
+    }
+
+    #[test]
+    fn test_keep_required_extensions() {
+        let dir = Path::new("/tmp");
+        let initial_target = dir.join("new_tool");
+
+        if cfg!(windows) {
+            // Keeps Windows executable extensions
+            assert_eq!(
+                keep_required_extensions(dir, "mytool.exe", "new_tool", initial_target.clone()),
+                dir.join("new_tool.exe")
+            );
+            assert_eq!(
+                keep_required_extensions(dir, "mytool.cmd", "new_tool", initial_target.clone()),
+                dir.join("new_tool.cmd")
+            );
+            assert_eq!(
+                keep_required_extensions(dir, "MYTOOL.BAT", "new_tool", initial_target.clone()),
+                dir.join("new_tool.bat")
+            );
+        } else {
+            // Does not append on non-windows
+            assert_eq!(
+                keep_required_extensions(dir, "mytool.exe", "new_tool", initial_target.clone()),
+                initial_target
+            );
+        }
+    }
+
+    #[test]
     fn test_list_available_platforms_with_key_flat_preserves_arch_underscore() {
         let mut opts = IndexMap::new();
         // Flat keys with os_arch_keytype naming
         opts.insert(
             "platforms_macos_x86_64_url".to_string(),
-            "https://example.com/macos-x86_64.tar.gz".to_string(),
+            toml::Value::String("https://example.com/macos-x86_64.tar.gz".to_string()),
         );
         opts.insert(
             "platforms_linux_x64_url".to_string(),
-            "https://example.com/linux-x64.tar.gz".to_string(),
+            toml::Value::String("https://example.com/linux-x64.tar.gz".to_string()),
         );
         // Different prefix variant also supported
         opts.insert(
             "platform_windows_arm64_url".to_string(),
-            "https://example.com/windows-arm64.zip".to_string(),
+            toml::Value::String("https://example.com/windows-arm64.zip".to_string()),
         );
 
         let tool_opts = ToolVersionOptions {
@@ -1039,7 +1174,8 @@ mod tests {
         let mut opts = IndexMap::new();
         opts.insert(
             "platforms".to_string(),
-            r#"
+            toml::Value::String(
+                r#"
 [macos-x64]
 checksum = "blake3:abc123"
 size = "1024"
@@ -1064,7 +1200,8 @@ size = "3072"
 checksum = "blake3:mno345"
 size = "5120"
 "#
-            .to_string(),
+                .to_string(),
+            ),
         );
 
         let tool_opts = ToolVersionOptions {
@@ -1096,8 +1233,11 @@ size = "5120"
     #[test]
     fn test_verify_artifact_fallback_to_generic() {
         let mut opts = IndexMap::new();
-        opts.insert("checksum".to_string(), "blake3:generic123".to_string());
-        opts.insert("size".to_string(), "512".to_string());
+        opts.insert(
+            "checksum".to_string(),
+            toml::Value::String("blake3:generic123".to_string()),
+        );
+        opts.insert("size".to_string(), toml::Value::String("512".to_string()));
 
         let tool_opts = ToolVersionOptions {
             opts,
@@ -1106,7 +1246,7 @@ size = "5120"
 
         // Test that generic fallback works when no platform-specific values exist
         let checksum = lookup_platform_key(&tool_opts, "checksum")
-            .or_else(|| tool_opts.get("checksum").cloned());
+            .or_else(|| tool_opts.get("checksum").map(|s| s.to_string()));
         let size = lookup_with_fallback(&tool_opts, "size");
 
         assert_eq!(checksum, Some("blake3:generic123".to_string()));
@@ -1118,7 +1258,8 @@ size = "5120"
         let mut opts = IndexMap::new();
         opts.insert(
             "platform".to_string(),
-            r#"
+            toml::Value::String(
+                r#"
 [macos-arm64]
 bin_path = "CMake.app/Contents/bin"
 
@@ -1128,7 +1269,8 @@ bin_path = "bin"
 [windows-x64]
 bin_path = "."
 "#
-            .to_string(),
+                .to_string(),
+            ),
         );
 
         let tool_opts = ToolVersionOptions {
@@ -1155,7 +1297,8 @@ bin_path = "."
         let mut opts = IndexMap::new();
         opts.insert(
             "platforms".to_string(),
-            r#"
+            toml::Value::String(
+                r#"
 [macos-arm64]
 bin = "xmake"
 
@@ -1165,7 +1308,8 @@ bin = "xmake"
 [windows-x64]
 bin = "xmake.exe"
 "#
-            .to_string(),
+                .to_string(),
+            ),
         );
 
         let tool_opts = ToolVersionOptions {
@@ -1190,14 +1334,19 @@ bin = "xmake.exe"
     #[test]
     fn test_lookup_platform_key_bin_with_fallback() {
         let mut opts = IndexMap::new();
-        opts.insert("bin".to_string(), "generic-tool".to_string());
+        opts.insert(
+            "bin".to_string(),
+            toml::Value::String("generic-tool".to_string()),
+        );
         opts.insert(
             "platforms".to_string(),
-            r#"
+            toml::Value::String(
+                r#"
 [windows-x64]
 bin = "tool.exe"
 "#
-            .to_string(),
+                .to_string(),
+            ),
         );
 
         let tool_opts = ToolVersionOptions {
@@ -1223,10 +1372,16 @@ bin = "tool.exe"
         let mut opts = IndexMap::new();
         opts.insert(
             "platforms_windows_x64_bin".to_string(),
-            "xmake.exe".to_string(),
+            toml::Value::String("xmake.exe".to_string()),
         );
-        opts.insert("platforms_linux_x64_bin".to_string(), "xmake".to_string());
-        opts.insert("platforms_macos_arm64_bin".to_string(), "xmake".to_string());
+        opts.insert(
+            "platforms_linux_x64_bin".to_string(),
+            toml::Value::String("xmake".to_string()),
+        );
+        opts.insert(
+            "platforms_macos_arm64_bin".to_string(),
+            toml::Value::String("xmake".to_string()),
+        );
 
         let tool_opts = ToolVersionOptions {
             opts,

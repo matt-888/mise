@@ -112,6 +112,7 @@ impl Config {
                 *GLOBAL_CONFIG_FILES.lock().unwrap() = None;
                 *SYSTEM_CONFIG_FILES.lock().unwrap() = None;
                 GLOB_RESULTS.lock().unwrap().clear();
+                crate::task::reset();
                 Ok(())
             },
             Duration::from_secs(5),
@@ -124,7 +125,7 @@ impl Config {
     pub async fn load() -> Result<Arc<Self>> {
         backend::load_tools().await?;
         let idiomatic_files = measure!("config::load idiomatic_files", {
-            load_idiomatic_files().await
+            load_idiomatic_filenames().await
         });
         let config_filenames = idiomatic_files
             .keys()
@@ -897,7 +898,7 @@ fn find_monorepo_config(config_files: &ConfigMap) -> Option<&Arc<dyn ConfigFile>
         .find(|cf| cf.experimental_monorepo_root() == Some(true))
 }
 
-async fn load_idiomatic_files() -> BTreeMap<String, Vec<String>> {
+async fn load_idiomatic_filenames() -> BTreeMap<String, Vec<String>> {
     let enable_tools = Settings::get().idiomatic_version_file_enable_tools.clone();
     if enable_tools.is_empty() {
         return BTreeMap::new();
@@ -1433,7 +1434,7 @@ async fn load_all_config_files(
 /// Load config files from a list of paths (for monorepo task config contexts)
 pub async fn load_config_files_from_paths(config_paths: &[PathBuf]) -> Result<ConfigMap> {
     backend::load_tools().await?;
-    let idiomatic_filenames = BTreeMap::new(); // TODO: support idiomatic files in config hierarchy loading
+    let idiomatic_filenames = load_idiomatic_filenames().await;
     let mut config_map = ConfigMap::default();
 
     for f in config_paths.iter().unique() {
@@ -1519,10 +1520,11 @@ fn load_plugins(config_files: &ConfigMap) -> Result<HashMap<String, String>> {
     Ok(plugins)
 }
 
-async fn load_vars(config: &Arc<Config>) -> Result<EnvResults> {
-    time!("load_vars start");
-    let entries = config
-        .config_files
+pub(crate) async fn resolve_vars_from_config_files(
+    config: &Arc<Config>,
+    config_files: &ConfigMap,
+) -> Result<EnvResults> {
+    let entries = config_files
         .iter()
         .rev()
         .map(|(source, cf)| {
@@ -1533,7 +1535,8 @@ async fn load_vars(config: &Arc<Config>) -> Result<EnvResults> {
         .into_iter()
         .flatten()
         .collect();
-    let vars_results = EnvResults::resolve(
+
+    EnvResults::resolve(
         config,
         config.tera_ctx.clone(),
         &env::PRISTINE_ENV,
@@ -1544,7 +1547,12 @@ async fn load_vars(config: &Arc<Config>) -> Result<EnvResults> {
             warn_on_missing_required: false,
         },
     )
-    .await?;
+    .await
+}
+
+async fn load_vars(config: &Arc<Config>) -> Result<EnvResults> {
+    time!("load_vars start");
+    let vars_results = resolve_vars_from_config_files(config, &config.config_files).await?;
     time!("load_vars done");
     if log::log_enabled!(log::Level::Trace) {
         trace!("{vars_results:#?}");
@@ -2440,6 +2448,28 @@ mod tests {
         assert!(result.contains_key(&file2_path));
         assert!(!result.contains_key(&sub_dir));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_load_task_file_supports_per_task_vars() -> Result<()> {
+        let config = Config::reset().await?;
+        let temp_dir = TempDir::new()?;
+        let tasks_toml = temp_dir.path().join("tasks.toml");
+        fs::write(
+            &tasks_toml,
+            r#"
+[build]
+description = "{{vars.target}}"
+run = "echo build"
+vars = { target = "linux" }
+"#,
+        )?;
+
+        let tasks = load_task_file(&config, &tasks_toml, temp_dir.path()).await?;
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].name, "build");
+        assert_eq!(tasks[0].description, "linux");
         Ok(())
     }
 }

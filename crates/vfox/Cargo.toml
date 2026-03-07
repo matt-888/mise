@@ -1,6 +1,6 @@
 [package]
 name = "vfox"
-version = "2026.2.3"
+version = "2026.2.4"
 edition = "2024"
 license = "MIT"
 description = "Interface to vfox plugins"
@@ -29,7 +29,7 @@ path = "src/bin.rs"
 
 [dependencies]
 homedir = "0.3"
-indexmap = "2"
+indexmap = { version = "2", features = ["serde"] }
 itertools = "0.14"
 log = "0.4"
 mlua = { version = "0.11", features = [

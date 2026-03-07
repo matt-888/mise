@@ -6,7 +6,7 @@ use crate::backend::static_helpers::get_filename_from_url;
 use crate::cli::args::BackendArg;
 use crate::cli::version::{ARCH, OS};
 use crate::config::Settings;
-use crate::file::TarOptions;
+use crate::file::{TarFormat, TarOptions};
 use crate::http::HTTP;
 use crate::install_context::InstallContext;
 use crate::lockfile::PlatformInfo;
@@ -24,7 +24,6 @@ use crate::{
 use crate::{backend::Backend, config::Config};
 use crate::{env, file, github, minisign};
 use async_trait::async_trait;
-use dashmap::DashMap;
 use eyre::{ContextCompat, Result, bail, eyre};
 use indexmap::IndexSet;
 use itertools::Itertools;
@@ -38,7 +37,6 @@ pub struct AquaBackend {
     ba: Arc<BackendArg>,
     id: String,
     version_tags_cache: CacheManager<Vec<(String, String)>>,
-    bin_path_caches: DashMap<String, CacheManager<Vec<PathBuf>>>,
 }
 
 #[async_trait]
@@ -136,7 +134,7 @@ impl Backend for AquaBackend {
             features.push(SecurityFeature::Checksum { algorithm });
         }
 
-        // GitHub Attestations - check registry config OR actual release assets
+        // GitHub Artifact Attestations - check registry config OR actual release assets
         let has_attestations_config = all_pkgs.iter().any(|p| {
             p.github_artifact_attestations
                 .as_ref()
@@ -473,18 +471,15 @@ impl Backend for AquaBackend {
             return Ok(vec![tv.install_path().join(".mise-bins")]);
         }
 
-        let cache = self
-            .bin_path_caches
-            .entry(tv.version.clone())
-            .or_insert_with(|| {
-                CacheManagerBuilder::new(tv.cache_path().join("bin_paths.msgpack.z"))
-                    .with_fresh_duration(Settings::get().fetch_remote_versions_cache())
-                    .build()
-            });
         let install_path = tv.install_path();
+        let cache: CacheManager<Vec<PathBuf>> =
+            CacheManagerBuilder::new(tv.cache_path().join("bin_paths.msgpack.z"))
+                .with_fresh_file(install_path.clone())
+                .with_fresh_duration(Settings::get().fetch_remote_versions_cache())
+                .build();
+
         let paths = cache
             .get_or_try_init_async(async || {
-                // TODO: align this logic with the one in `install_version_`
                 let pkg = AQUA_REGISTRY
                     .package_with_version(&self.id, &[&tv.version])
                     .await?;
@@ -669,7 +664,6 @@ impl AquaBackend {
             version_tags_cache: CacheManagerBuilder::new(cache_path.join("version_tags.msgpack.z"))
                 .with_fresh_duration(Settings::get().fetch_remote_versions_cache())
                 .build(),
-            bin_path_caches: Default::default(),
         }
     }
 
@@ -945,7 +939,7 @@ impl AquaBackend {
     ) -> Result<()> {
         self.verify_slsa(ctx, tv, pkg, v, filename).await?;
         self.verify_minisign(ctx, tv, pkg, v, filename).await?;
-        self.verify_github_attestations(ctx, tv, pkg, v, filename)
+        self.verify_github_artifact_attestations(ctx, tv, pkg, v, filename)
             .await?;
 
         let download_path = tv.download_path();
@@ -1141,7 +1135,7 @@ impl AquaBackend {
         Ok(())
     }
 
-    async fn verify_github_attestations(
+    async fn verify_github_artifact_attestations(
         &self,
         ctx: &InstallContext,
         tv: &ToolVersion,
@@ -1152,17 +1146,18 @@ impl AquaBackend {
         // Check if attestations are enabled via global and aqua-specific settings
         let settings = Settings::get();
         if !settings.github_attestations || !settings.aqua.github_attestations {
-            debug!("GitHub attestations verification disabled");
+            debug!("GitHub artifact attestations verification disabled");
             return Ok(());
         }
 
         if let Some(github_attestations) = &pkg.github_artifact_attestations {
             if github_attestations.enabled == Some(false) {
-                debug!("GitHub attestations verification is disabled for {tv}");
+                debug!("GitHub artifact attestations verification is disabled for {tv}");
                 return Ok(());
             }
 
-            ctx.pr.set_message("verify GitHub attestations".to_string());
+            ctx.pr
+                .set_message("verify GitHub artifact attestations".to_string());
 
             let artifact_path = tv.download_path().join(filename);
 
@@ -1183,22 +1178,22 @@ impl AquaBackend {
             {
                 Ok(true) => {
                     ctx.pr
-                        .set_message("✓ GitHub attestations verified".to_string());
-                    debug!("GitHub attestations verified successfully for {tv}");
+                        .set_message("✓ GitHub artifact attestations verified".to_string());
+                    debug!("GitHub artifact attestations verified successfully for {tv}");
                 }
                 Ok(false) => {
                     return Err(eyre!(
-                        "GitHub attestations verification returned false for {tv}"
+                        "GitHub artifact attestations verification returned false for {tv}"
                     ));
                 }
                 Err(sigstore_verification::AttestationError::NoAttestations) => {
                     return Err(eyre!(
-                        "No GitHub attestations found for {tv}, but attestations are expected per aqua registry configuration"
+                        "No GitHub artifact attestations found for {tv}, but they are expected per aqua registry configuration"
                     ));
                 }
                 Err(e) => {
                     return Err(eyre!(
-                        "GitHub attestations verification failed for {tv}: {e}"
+                        "GitHub artifact attestations verification failed for {tv}: {e}"
                     ));
                 }
             }
@@ -1420,10 +1415,8 @@ impl AquaBackend {
             .first()
             .expect("at least one bin path should exist");
         let tar_opts = TarOptions {
-            format: format.parse().unwrap_or_default(),
             pr: Some(ctx.pr.as_ref()),
-            strip_components: 0,
-            ..Default::default()
+            ..TarOptions::new(TarFormat::from_ext(format))
         };
         let mut make_executable = false;
         if let AquaPackageType::GithubArchive = pkg.r#type {
